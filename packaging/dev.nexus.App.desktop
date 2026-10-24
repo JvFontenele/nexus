@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Nexus
+Comment=Dispositivos pareados, pareamento e permissões
+Exec=/usr/bin/python3 -m nexus app
+Path=@SRC@
+Icon=phone-symbolic
+Categories=Network;
+StartupNotify=true
+DBusActivatable=false

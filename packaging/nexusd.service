@@ -1,0 +1,15 @@
+[Unit]
+Description=Nexus daemon (integração PC ↔ dispositivos)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/python3 -m nexus daemon
+WorkingDirectory=@SRC@
+Restart=on-failure
+RestartSec=5
+# sem root; só o necessário
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=graphical-session.target
