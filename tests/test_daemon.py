@@ -234,6 +234,8 @@ class TestDaemon(unittest.TestCase):
         ids = [a["id"] for a in c.recv()["body"]["actions"]]
         self.assertIn("test.say", ids)
         self.assertNotIn("core.echo", ids)  # não é phone_safe
+        c.send("actions.list", {})
+        self.assertFalse(next(x for x in c.recv()["body"]["actions"] if x["id"] == "test.say")["allowed"])
 
         def run(action, params):
             c.send("action.run", {"action": action, "params": params})
@@ -371,6 +373,8 @@ class TestDaemon(unittest.TestCase):
     def test_file_push_and_pull(self):
         import struct as st
         from unittest import mock
+        events = []
+        self.d.emit = events.append
         c = self.pair()
         down = Path(tempfile.mkdtemp(dir=self.tmp.name))
         with mock.patch("nexus.files.download_dir", return_value=down), mock.patch("nexus.actions.desktop.notify"):
@@ -382,12 +386,37 @@ class TestDaemon(unittest.TestCase):
                 a.raw(st.pack(">I", 100000) + data[i:i + 100000])
             self.assertEqual(a.recv()["body"], {"ok": True, "result": "segredo.txt"})
             self.assertEqual((down / "segredo.txt").read_bytes(), data)
+            prog = [e for e in events if e["event"] == "file.progress"]
+            self.assertEqual((prog[-1]["done"], prog[-1]["total"]), (len(data), len(data)))
+            self.assertTrue(any(e["event"] == "file.done" and e["ok"] for e in events))
+            # cancelar no meio: a conexão cai, o .part some e o fim é ok=False
+            k = self.client(self.phone)
+            k.send("file.push", {"name": "grande.bin", "size": 10_000_000})
+            k.recv()
+            k.raw(st.pack(">I", 100000) + bytes(100000))
+            for _ in range(100):
+                if self.d.transfers:
+                    break
+                time.sleep(0.02)
+            tid = next(iter(self.d.transfers))
+            self.assertTrue(self.call(self.d._control_cmd({"cmd": "file.cancel", "id": tid}))["ok"])
+            self.assertTrue(k.closed())
+            for _ in range(100):
+                if any(e["event"] == "file.done" and not e["ok"] for e in events):
+                    break
+                time.sleep(0.02)
+            self.assertTrue(any(e["event"] == "file.done" and not e["ok"] for e in events))
+            self.assertFalse(self.d.transfers)
             # anunciou 10 bytes e mandou 20: rejeita e não deixa resto
             b = self.client(self.phone)
             b.send("file.push", {"name": "x.bin", "size": 10})
             b.recv()
             b.raw(st.pack(">I", 20) + bytes(20))
             self.assertEqual(b.recv()["body"]["code"], "bad_frame")
+            for _ in range(100):  # o .part do envio cancelado some no finally
+                if sorted(p.name for p in down.iterdir()) == ["segredo.txt"]:
+                    break
+                time.sleep(0.02)
             self.assertEqual(sorted(p.name for p in down.iterdir()), ["segredo.txt"])
         # PC → dispositivo
         src = down / "segredo.txt"
@@ -408,6 +437,18 @@ class TestDaemon(unittest.TestCase):
         again = self.client(self.phone)  # oferta é de uso único
         again.send("file.pull", {"id": offer["id"]})
         self.assertEqual(again.recv()["body"]["code"], "unauthorized")
+
+    def test_ui_open(self):
+        from unittest import mock
+        self.pair()
+        with mock.patch("subprocess.Popen") as popen:
+            ok = self.call(self.d._control_cmd({"cmd": "ui.open", "what": "send-file", "device_id": self.fp_phone}))
+            self.assertTrue(ok["ok"])
+            self.assertEqual(popen.call_args[0][0][-2:], ["send-file", self.fp_phone])
+            bad = self.call(self.d._control_cmd({"cmd": "ui.open", "what": "send-file", "device_id": "; rm -rf ~"}))
+            self.assertFalse(bad["ok"])  # só ids de dispositivos pareados viram argumento
+            self.assertFalse(self.call(self.d._control_cmd({"cmd": "ui.open", "what": "bash"}))["ok"])
+            self.assertEqual(popen.call_count, 1)
 
     def test_control_socket(self):
         path = self.data / "run" / "control.sock"

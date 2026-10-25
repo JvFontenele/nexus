@@ -21,6 +21,7 @@ class TestAdbSerial(unittest.TestCase):
     def test_match_and_filters(self):
         self.assertEqual(self.run_with("22101320G"), "7db4da6e")  # offline ignorado
         self.assertEqual(self.run_with("SM_X200"), "adb-XYZ._adb-tls-connect._tcp")
+        self.assertEqual(self.run_with("SM-X200"), "adb-XYZ._adb-tls-connect._tcp")  # Build.MODEL com hífen
         self.assertIsNone(self.run_with("Ruim"))  # serial com caractere inválido
         self.assertIsNone(self.run_with("2210"))  # só casa o modelo inteiro
 

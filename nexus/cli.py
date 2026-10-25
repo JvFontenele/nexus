@@ -31,6 +31,7 @@ def main(argv=None):
     dmn.add_argument("--port", type=int, default=47210)
 
     sub.add_parser("app")
+    sub.add_parser("send-file").add_argument("device_id")
     sub.add_parser("mirror").add_argument("device_id", nargs="?", help="prefixo; padrão: o primeiro conectado")
 
     pair = sub.add_parser("pair").add_subparsers(dest="pair_cmd", required=True)
@@ -59,6 +60,9 @@ def main(argv=None):
     if args.command == "app":
         from nexus.app import main as app_main
         return app_main()
+    if args.command == "send-file":
+        from nexus.app import send_file
+        return send_file(args.device_id)
     if args.command == "mirror":
         return _cmd_mirror(args)
     if args.command == "pair":

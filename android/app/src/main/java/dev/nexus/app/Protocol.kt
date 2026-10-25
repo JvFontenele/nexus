@@ -160,9 +160,9 @@ class Session(host: String, port: Int, private val id: Identity, pin: String?, p
 const val BuildConfigVersion = "0.1.0"
 
 /** Pareamento completo. `confirm` mostra o código ao usuário e devolve a decisão. Devolve o fingerprint do PC a pinar. */
-fun pair(host: String, port: Int, id: Identity, kind: String, name: String, confirm: (code: String, fpS: String) -> Boolean): String {
+fun pair(host: String, port: Int, id: Identity, kind: String, name: String, confirm: (code: String, fpS: String) -> Boolean): Pair<String, String> {
     Session(host, port, id, pin = null, presentCert = false).use { s ->
-        s.hello(kind, name, withCert = true)
+        val pcName = s.hello(kind, name, withCert = true).optString("name")
         val nC = newNonce()
         s.send("pair.request", JSONObject().put("commit", commit(nC, id.deviceId, s.serverFp)))
         val ch = s.expect("pair.challenge")
@@ -176,22 +176,22 @@ fun pair(host: String, port: Int, id: Identity, kind: String, name: String, conf
         if (!ok) throw ProtocolException("recusado no telefone")
         val r = s.expect("pair.result")
         if (!r.optBoolean("ok")) throw ProtocolException("PC recusou: ${r.optString("reason")}")
-        return s.serverFp
+        return s.serverFp to pcName
     }
 }
 
-/** Conexão pareada (mTLS + pin) com um ping; devolve o RTT em ms. */
-fun ping(host: String, port: Int, id: Identity, pin: String, kind: String, name: String): Long {
+/** Conexão pareada (mTLS + pin) com um ping; devolve (RTT em ms, nome do PC). */
+fun ping(host: String, port: Int, id: Identity, pin: String, kind: String, name: String): Pair<Long, String> {
     Session(host, port, id, pin = pin, presentCert = true).use { s ->
-        s.hello(kind, name, withCert = false)
+        val pcName = s.hello(kind, name, withCert = false).optString("name")
         val t0 = System.nanoTime()
         s.send("ping")
         s.expect("pong")
-        return (System.nanoTime() - t0) / 1_000_000
+        return (System.nanoTime() - t0) / 1_000_000 to pcName
     }
 }
 
-data class RemoteAction(val id: String, val description: String, val params: List<String>)
+data class RemoteAction(val id: String, val description: String, val params: List<String>, val allowed: Boolean = true)
 
 /** Abre uma sessão pareada, faz o hello e executa `block`. */
 fun <T> paired(host: String, port: Int, id: Identity, pin: String, kind: String, name: String, block: (Session) -> T): T =
@@ -205,7 +205,8 @@ fun Pc.listActions(): List<RemoteAction> {
     return List(arr.length()) { i ->
         val a = arr.getJSONObject(i)
         val ps = a.optJSONArray("params") ?: JSONArray()
-        RemoteAction(a.getString("id"), a.optString("description"), List(ps.length()) { ps.getJSONObject(it).getString("name") })
+        RemoteAction(a.getString("id"), a.optString("description"), List(ps.length()) { ps.getJSONObject(it).getString("name") },
+            a.optBoolean("allowed", true))
     }
 }
 

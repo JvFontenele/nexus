@@ -28,7 +28,10 @@ class LinkService : Service(), Pc {
     private val pinger = Executors.newSingleThreadScheduledExecutor()
     @Volatile private var linkText = "Conectando…"
     val audio by lazy {
-        AudioReceiver(this) { audioText -> notify(1, status(listOfNotNull(linkText, audioText).joinToString(" · "))) }
+        AudioReceiver(this) { audioText ->
+            lastAudioText = audioText
+            notify(1, status(listOfNotNull(linkText, audioText).joinToString(" · ")))
+        }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -162,6 +165,10 @@ class LinkService : Service(), Pc {
 
         /** A conexão persistente, se estiver de pé. */
         fun connected(): Pc? = current
+
+        /** Para a tela: áudio do PC tocando aqui e o texto de latência da notificação. */
+        fun audioPlaying(): Boolean = current?.audio?.playing == true
+        @Volatile var lastAudioText: String? = null
 
         /** Liga/desliga o áudio do PC aqui; null se a conexão persistente não estiver ativa. */
         fun toggleAudio(): Boolean? = current?.audio?.let { val on = !it.playing; if (on) it.start() else it.stop(); on }

@@ -73,9 +73,10 @@ def adb_serial(model: str) -> str | None:
         out = subprocess.run(["adb", "devices", "-l"], capture_output=True, text=True, timeout=10).stdout
     except (subprocess.SubprocessError, OSError):
         return None
+    adb_model = re.sub(r"[^A-Za-z0-9]", "_", model)  # o adb mostra "SM-X400" como "model:SM_X400"
     for line in out.splitlines()[1:]:
         parts = line.split()
-        if len(parts) >= 2 and parts[1] == "device" and f"model:{model}" in parts and _SERIAL.fullmatch(parts[0]):
+        if len(parts) >= 2 and parts[1] == "device" and f"model:{adb_model}" in parts and _SERIAL.fullmatch(parts[0]):
             return parts[0]
     return None
 

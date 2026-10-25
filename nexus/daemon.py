@@ -118,6 +118,7 @@ class Daemon:
         self.pair_hits: dict[str, collections.deque] = {}
         self.audio_conn: Conn | None = None
         self.offers: dict[str, tuple[str, Path, float]] = {}  # id → (device_id, arquivo, prazo)
+        self.transfers: dict[str, dict] = {}  # id → {"conn", "last"}: para progresso e cancelamento
         self.handshaking = 0
         self.servers = []
         # trocados pela ponte D-Bus (nexus/dbus.py); sem ela o daemon funciona igual
@@ -231,7 +232,9 @@ class Daemon:
             self.revoke(conn.device_id)
             raise _Close()
         elif t == "actions.list":
-            await conn.send(make("actions.result", {"actions": _phone_actions()}, re=rid))
+            perms = self.store.records[conn.device_id]["permissions"]
+            items = [{**x, "allowed": x["id"] in perms or "*phone_safe" in perms} for x in _phone_actions()]
+            await conn.send(make("actions.result", {"actions": items}, re=rid))
         elif t == "action.run":
             await conn.send(make("action.result", await self._run_action(conn, body), re=rid))
         elif t == "mirror.request":
@@ -477,6 +480,23 @@ class Daemon:
             log_event({"event": "audio.stop", "device_id": conn.device_id})
             self.emit({"event": "audio.changed", "device_id": conn.device_id, "on": False})
 
+    def _transfer_start(self, conn: Conn) -> dict:
+        t = {"id": new_offer_id()[:16], "conn": conn, "last": 0.0}
+        self.transfers[t["id"]] = t
+        return t
+
+    def _transfer_progress(self, t: dict, direction: str, name: str, done: int, total: int):
+        now = time.monotonic()
+        if now - t["last"] >= 0.25 or done == total:  # no máximo 4 eventos por segundo
+            t["last"] = now
+            self.emit({"event": "file.progress", "id": t["id"], "direction": direction, "device_id": t["conn"].device_id,
+                       "device_name": t["conn"].record["name"], "name": name, "done": done, "total": total})
+
+    def _transfer_end(self, t: dict, direction: str, name: str, ok: bool):
+        self.transfers.pop(t["id"], None)
+        self.emit({"event": "file.done", "id": t["id"], "direction": direction, "device_id": t["conn"].device_id,
+                   "name": name, "ok": ok})
+
     async def _file_push(self, conn: Conn, body: dict, rid: str):
         """Recebe um arquivo do dispositivo em ~/Downloads/Nexus (nome saneado, sem sobrescrever, .part até completar)."""
         from nexus import files
@@ -490,6 +510,7 @@ class Daemon:
         dest = files.unique_path(directory, files.safe_name(body["name"]))
         part = dest.with_name(dest.name + ".part")
         ok = False
+        t = self._transfer_start(conn)
         try:
             with open(part, "xb") as f:  # x: falha se outro envio pegou o mesmo nome no meio tempo
                 await conn.send(make("file.ready", {}, re=rid))
@@ -500,11 +521,13 @@ class Daemon:
                         raise ProtocolError("bad_frame", "mais dados que o anunciado")
                     f.write(await asyncio.wait_for(conn.reader.readexactly(n), IDLE))
                     remaining -= n
+                    self._transfer_progress(t, "in", dest.name, size - remaining, size)
             os.replace(part, dest)
             ok = True
         finally:
             if not ok:
                 part.unlink(missing_ok=True)
+            self._transfer_end(t, "in", dest.name, ok)
         name = conn.record["name"]
         log_event({"event": "file.received", "device_id": conn.device_id, "bytes": size})
         self.emit({"event": "file.received", "device_id": conn.device_id, "name": name, "path": str(dest)})
@@ -542,14 +565,23 @@ class Daemon:
         _dev, path, _deadline = offer
         size = path.stat().st_size
         await conn.send(make("file.ready", {"name": path.name, "size": size}, re=rid))
-        with open(path, "rb") as f:
-            while chunk := f.read(files.CHUNK):
-                conn.writer.write(struct.pack(">I", len(chunk)) + chunk)
-                await asyncio.wait_for(conn.writer.drain(), IDLE)
-                if conn.writer.is_closing():
-                    return
-        log_event({"event": "file.sent", "device_id": conn.device_id, "bytes": size})
-        await asyncio.wait_for(conn.reader.read(1), IDLE)  # espera o dispositivo fechar: só então o arquivo chegou todo
+        t = self._transfer_start(conn)
+        ok = False
+        try:
+            sent = 0
+            with open(path, "rb") as f:
+                while chunk := f.read(files.CHUNK):
+                    if conn.writer.is_closing():
+                        return  # cancelado
+                    conn.writer.write(struct.pack(">I", len(chunk)) + chunk)
+                    await asyncio.wait_for(conn.writer.drain(), IDLE)
+                    sent += len(chunk)
+                    self._transfer_progress(t, "out", path.name, sent, size)
+            log_event({"event": "file.sent", "device_id": conn.device_id, "bytes": size})
+            await asyncio.wait_for(conn.reader.read(1), IDLE)  # espera o dispositivo fechar: só então o arquivo chegou todo
+            ok = not conn.writer.is_closing() or sent == size
+        finally:
+            self._transfer_end(t, "out", path.name, ok)
 
     # ── controle local (CLI) ─────────────────────────────────────────────
     async def _control(self, reader, writer):
@@ -588,6 +620,24 @@ class Daemon:
             from nexus.actions.desktop import mirror
             conn = self.by_device.get(rec["device_id"])
             return await asyncio.to_thread(mirror, rec["name"], conn.ip if conn else None)
+        if cmd == "ui.open":
+            # o notch do Balão pede: o daemon abre o app ou o seletor (o Shell não tem diálogo de arquivos)
+            what, dev = req.get("what"), str(req.get("device_id", ""))
+            if what == "app":
+                argv = ["app"]
+            elif what == "send-file" and dev in self.store.records:
+                argv = ["send-file", dev]
+            else:
+                return {"ok": False, "error": "nada a abrir"}
+            subprocess.Popen([sys.executable, "-m", "nexus", *argv], cwd=Path(nexus.__file__).parent.parent,
+                             start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return {"ok": True}
+        if cmd == "file.cancel":
+            t = self.transfers.get(str(req.get("id")))
+            if t is None:
+                return {"ok": False, "error": "transferência não encontrada"}
+            t["conn"].close()
+            return {"ok": True}
         if cmd == "send.file":
             return await self._offer_file(str(req.get("device_id")), str(req.get("path")))
         if cmd in ("audio.start", "audio.stop"):
