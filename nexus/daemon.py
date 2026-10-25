@@ -636,7 +636,8 @@ class Daemon:
             t = self.transfers.get(str(req.get("id")))
             if t is None:
                 return {"ok": False, "error": "transferência não encontrada"}
-            t["conn"].close()
+            # abort, não close: o close do TLS espera o close_notify do outro lado (até 30 s) e o laço ficaria preso
+            t["conn"].writer.transport.abort()
             return {"ok": True}
         if cmd == "send.file":
             return await self._offer_file(str(req.get("device_id")), str(req.get("path")))
