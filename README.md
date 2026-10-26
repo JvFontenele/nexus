@@ -33,6 +33,14 @@ Tudo é próprio, sem KDE Connect nem Zorin Connect, cifrado de ponta a ponta e 
 |---|---|
 | <img src="docs/img/pc-borda.png" alt="Aba Teclado e mouse: o celular encostado na borda esquerda do monitor 1, por Bluetooth"> | <img src="docs/img/android.png" alt="App Android com a barra inferior: Início e Áudio"> |
 
+**No topo da tela (notch do Balão)**
+
+<p align="center"><img src="docs/img/notch.png" width="720" alt="Notch aberto: o Nexo com o celular conectado e as ações"></p>
+
+| Pedido de permissão do Claude Code | Pareamento |
+|---|---|
+| <img src="docs/img/notch-claude.png" alt="O Nexo no notch com o pedido do Claude Code para usar o Bash: Negar, Permitir, Sempre, Responder no terminal"> | <img src="docs/img/notch-pareamento.png" alt="O Nexo no notch com o código de pareamento do celular"> |
+
 ## Segurança
 - Pareamento com código de 6 dígitos conferido nos dois lados (SAS com commit/reveal) e um certificado por aparelho.
 - TLS 1.3 com autenticação mútua. Quem decide se um aparelho é confiável é a lista de pareados (`trusted.json`), e cada aparelho pode ser revogado.
