@@ -4,9 +4,21 @@ import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.hardware.input.InputManager
+import android.media.projection.MediaProjectionConfig
+import android.media.projection.MediaProjectionManager
+import android.net.Uri
+import android.net.nsd.NsdManager
+import android.net.nsd.NsdServiceInfo
+import android.os.Build
+import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateContentSize
@@ -17,18 +29,6 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.togetherWith
-import androidx.compose.material3.LinearProgressIndicator
-import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.key
-import android.net.Uri
-import android.net.nsd.NsdManager
-import android.net.nsd.NsdServiceInfo
-import android.os.Build
-import android.os.Bundle
-import androidx.activity.ComponentActivity
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.compose.setContent
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -52,6 +52,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -61,8 +62,10 @@ import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -75,9 +78,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import kotlinx.coroutines.delay
 import java.util.concurrent.CompletableFuture
 import kotlin.concurrent.thread
+import kotlinx.coroutines.delay
 
 class MainActivity : ComponentActivity() {
     private val prefs by lazy { getSharedPreferences("nexus", Context.MODE_PRIVATE) }
@@ -90,6 +93,18 @@ class MainActivity : ComponentActivity() {
     private var linkUp by mutableStateOf(false)
     private var audioOn by mutableStateOf(false)
     private var audioText by mutableStateOf<String?>(null)
+    private var audioOutOn by mutableStateOf(false)
+    private val pedirCaptura = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
+        val data = r.data
+        status = if (r.resultCode != RESULT_OK || data == null) "Áudio para o PC: cancelado"
+        else when (runCatching { LinkService.startAudioOut(r.resultCode, data) }.getOrElse { status = "Erro: ${it.message}"; return@registerForActivityResult }) {
+            null -> "Ligue \"Manter conectado\" primeiro"
+            else -> "Mandando o áudio para o PC"
+        }
+    }
+    private val pedirMicrofone = registerForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
+        if (ok) pedirConfirmacao() else status = "Sem a permissão de áudio, o Android não deixa capturar o som dos apps"
+    }
     private var settings by mutableStateOf(false)
     private var pending by mutableStateOf<Pair<String, String>?>(null) // código, fp do PC
     private var decision: CompletableFuture<Boolean>? = null
@@ -114,6 +129,19 @@ class MainActivity : ComponentActivity() {
         val tema = darkColorScheme(primary = Cores.acento, onPrimary = Cores.acentoEscuro, background = Cores.fundo,
             surface = Cores.fundo, onSurface = Cores.texto, onBackground = Cores.texto)
         setContent { MaterialTheme(colorScheme = tema) { Surface(Modifier.fillMaxSize(), color = Cores.fundo) { Tela() } } }
+        pedidoDoPc(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        pedidoDoPc(intent)
+    }
+
+    /** Toque na notificação "O PC pediu o áudio deste aparelho". */
+    private fun pedidoDoPc(intent: Intent?) {
+        if (intent?.action != LinkService.ACTION_MANDAR_AUDIO) return
+        intent.action = null // girar a tela não pede de novo
+        if (!LinkService.audioSending()) toggleAudioOut()
     }
 
     // onStart, não só onCreate: o HyperOS mata o serviço, e voltar ao app deve religá-lo
@@ -197,6 +225,22 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun toggleAudioOut() {
+        when {
+            LinkService.audioSending() -> { LinkService.stopAudioOut(); status = "Áudio para o PC parado" }
+            LinkService.connected() == null -> status = "Ligue \"Manter conectado\" primeiro"
+            checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED -> pedirConfirmacao()
+            else -> pedirMicrofone.launch(android.Manifest.permission.RECORD_AUDIO)
+        }
+    }
+
+    private fun pedirConfirmacao() {
+        val mpm = getSystemService(MediaProjectionManager::class.java)
+        // tela inteira: no Android 14+, "um app só" também serviria, mas pergunta qual app a cada vez
+        pedirCaptura.launch(if (Build.VERSION.SDK_INT >= 34) mpm.createScreenCaptureIntent(MediaProjectionConfig.createConfigForDefaultDisplay())
+            else mpm.createScreenCaptureIntent())
+    }
+
     private fun toggleLink(on: Boolean) {
         linked = on
         prefs.edit().putBoolean("link", on).apply()
@@ -264,6 +308,7 @@ class MainActivity : ComponentActivity() {
                 linkUp = LinkService.connected() != null
                 audioOn = LinkService.audioPlaying()
                 audioText = LinkService.lastAudioText
+                audioOutOn = LinkService.audioSending()
                 autoclique = LinkService.cliqueAutomatico(this@MainActivity)
                 bateriaLivre = getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
                 delay(1000)
@@ -417,14 +462,18 @@ class MainActivity : ComponentActivity() {
             } }
 
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                Bloco(Icone.ESPELHAR, Cores.azulClaro, "Espelhar no PC", null, false, true, Modifier.weight(1f), ::mirror)
-                Bloco(Icone.AUDIO, Cores.azulClaro, "Áudio do PC", if (audioOn) audioText?.removePrefix("Áudio do PC · ") else null,
+                Bloco(Icone.AUDIO, Cores.azulClaro, "Áudio do PC aqui", if (audioOn) audioText?.removePrefix("Áudio do PC · ") else null,
                     audioOn, linkUp, Modifier.weight(1f), ::toggleAudio)
+                Bloco(Icone.AUDIO, Cores.verdeClaro, "Áudio daqui no PC", if (audioOutOn) "tocando no PC" else null,
+                    audioOutOn, linkUp || audioOutOn, Modifier.weight(1f), ::toggleAudioOut)
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Bloco(Icone.ESPELHAR, Cores.azulClaro, "Espelhar no PC", null, false, true, Modifier.weight(1f), ::mirror)
+                Bloco(Icone.ARQUIVO, Cores.laranja, "Enviar arquivo", null, false, true, Modifier.weight(1f)) { pick.launch(arrayOf("*/*")) }
             }
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 Bloco(Icone.CLIPBOARD, Cores.verdeClaro, "Enviar área de transferência", null, false, true, Modifier.weight(1f),
                     ::sendClipboard)
-                Bloco(Icone.ARQUIVO, Cores.laranja, "Enviar arquivo", null, false, true, Modifier.weight(1f)) { pick.launch(arrayOf("*/*")) }
             }
 
             if (actions.isNotEmpty()) Cartao { ControlarPc() }

@@ -567,6 +567,54 @@ class TestDaemon(unittest.TestCase):
         u.send("audio.attach", {})
         self.assertEqual(u.recv()["body"]["code"], "unauthorized")
 
+    def test_audio_push(self):
+        import struct as st
+        import sys
+        from unittest import mock
+        events = []
+        self.d.emit = events.append
+        c = self.pair()
+        out = Path(self.tmp.name) / "tocado.raw"
+        sink = [sys.executable, "-c", f"import sys\nf = open({str(out)!r}, 'wb', buffering=0)\n"
+                "while b := sys.stdin.buffer.read1(65536): f.write(b)"]
+        fmt = {"rate": 48000, "channels": 2, "format": "s16le"}
+        with mock.patch("nexus.audio.playback_argv", return_value=sink) as argv:
+            a = self.client(self.phone)
+            a.send("audio.push", fmt)
+            self.assertEqual(a.recv()["body"]["code"], "forbidden")  # permissão desligada por padrão
+            # o PC pede: vale uma vez, sem a permissão
+            self.assertTrue(self.call(self.d._control_cmd({"cmd": "audio.in.start", "device_id": self.fp_phone}))["ok"])
+            self.assertEqual(c.recv()["type"], "audio.in.start")
+            a = self.client(self.phone)
+            a.send("audio.push", {**fmt, "rate": 44100})
+            self.assertEqual(a.recv()["body"]["code"], "bad_format")
+            self.assertTrue(self.call(self.d._control_cmd({"cmd": "devices.allow", "device_id": self.fp_phone,
+                                                             "action": "audio.in"}))["ok"])
+            a = self.client(self.phone)
+            a.send("audio.push", fmt)
+            self.assertEqual(a.recv()["body"], fmt)
+            for i in range(3):
+                a.raw(st.pack(">I", 1920) + bytes([i]) * 1920)
+            for _ in range(100):
+                if self.call(self.d._control_cmd({"cmd": "devices.list"}))["audio_in"]:
+                    break
+                time.sleep(0.02)
+            self.assertEqual(self.call(self.d._control_cmd({"cmd": "devices.list"}))["audio_in"], [self.fp_phone])
+            self.assertEqual(argv.call_args[0][:2], ("teste", self.fp_phone[:12]))
+            for _ in range(100):
+                if out.exists() and out.stat().st_size == 3 * 1920:
+                    break
+                time.sleep(0.02)
+            self.assertTrue(self.call(self.d._control_cmd({"cmd": "audio.in.stop", "device_id": self.fp_phone}))["ok"])
+            self.assertTrue(a.closed())
+            self.assertEqual(out.read_bytes(), bytes(1920) + b"\x01" * 1920 + b"\x02" * 1920)
+            for _ in range(100):
+                if not self.call(self.d._control_cmd({"cmd": "devices.list"}))["audio_in"]:
+                    break
+                time.sleep(0.02)
+            self.assertEqual(self.call(self.d._control_cmd({"cmd": "devices.list"}))["audio_in"], [])
+        self.assertIn({"event": "audio.in.changed", "device_id": self.fp_phone, "on": False}, events)
+
     def test_file_push_and_pull(self):
         import struct as st
         from unittest import mock

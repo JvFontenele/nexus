@@ -44,6 +44,13 @@ class LinkService : Service(), Pc {
             atualizar()
         }
     }
+    val audioOut by lazy {
+        AudioSender(this) { text ->
+            lastAudioOutText = text
+            if (text == null) tipo(false) // parou: o serviço deixa de ser de captura
+            atualizar()
+        }
+    }
     @Volatile private var controlado = false
     private val entrada = object : InputManager.InputDeviceListener {
         override fun onInputDeviceAdded(id: Int) = mudou()
@@ -53,8 +60,24 @@ class LinkService : Service(), Pc {
     }
 
     /** Notificação persistente: conexão · áudio · teclado/mouse do PC. */
-    private fun atualizar() = notify(1, status(listOfNotNull(linkText, lastAudioText,
-        "PC no teclado e mouse".takeIf { controlado }).joinToString(" · ")))
+    private fun atualizar() = notify(1, status(texto()))
+
+    private fun texto() = listOfNotNull(linkText, lastAudioText, lastAudioOutText,
+        "PC no teclado e mouse".takeIf { controlado }).joinToString(" · ")
+
+    /** O Android 14+ exige o tipo mediaProjection no serviço antes de usar a confirmação, e só enquanto captura. */
+    private fun tipo(captura: Boolean) = runCatching {
+        startForeground(1, status(texto()), ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or
+            (if (captura) ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION else 0))
+    }
+
+    /** A tela recebeu a confirmação do usuário: começa a mandar o áudio deste aparelho para o PC. */
+    fun startAudioOut(resultCode: Int, data: Intent) {
+        tipo(true).getOrElse { throw ProtocolException("o Android recusou a captura: ${it.message}") }
+        val mp = getSystemService(android.media.projection.MediaProjectionManager::class.java).getMediaProjection(resultCode, data)
+            ?: throw ProtocolException("a confirmação expirou")
+        audioOut.start(mp)
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -77,6 +100,7 @@ class LinkService : Service(), Pc {
         running = false
         getSystemService(InputManager::class.java).unregisterInputDeviceListener(entrada)
         audio.stop()
+        audioOut.stop()
         current = null
         pinger.shutdownNow()
         runCatching { session?.close() }
@@ -156,6 +180,11 @@ class LinkService : Service(), Pc {
             }
             "audio.start" -> audio.start()
             "audio.stop" -> audio.stop()
+            // o PC pede o áudio deste aparelho: a confirmação do Android precisa de uma tela, aberta pela notificação
+            "audio.in.start" -> if (!audioOut.sending) notify(PEDIDO_AUDIO, push("O PC pediu o áudio deste aparelho",
+                "Toque para mandar o som dos apps para o PC", PendingIntent.getActivity(this, PEDIDO_AUDIO,
+                    Intent(this, MainActivity::class.java).setAction(ACTION_MANDAR_AUDIO), PendingIntent.FLAG_IMMUTABLE)))
+            "audio.in.stop" -> audioOut.stop()
             "open.url" -> {
                 val uri = Uri.parse(body.optString("url"))
                 if (uri.scheme != "https" && uri.scheme != "http") return
@@ -195,6 +224,15 @@ class LinkService : Service(), Pc {
         /** Para a tela: áudio do PC tocando aqui e o texto de latência da notificação. */
         fun audioPlaying(): Boolean = current?.audio?.playing == true
         @Volatile var lastAudioText: String? = null
+
+        /** Áudio deste aparelho tocando no PC. */
+        fun audioSending(): Boolean = current?.audioOut?.sending == true
+        @Volatile var lastAudioOutText: String? = null
+        fun stopAudioOut() { current?.audioOut?.stop() }
+        /** null se a conexão persistente não estiver ativa. */
+        fun startAudioOut(resultCode: Int, data: Intent): Boolean? = current?.let { it.startAudioOut(resultCode, data); true }
+        const val ACTION_MANDAR_AUDIO = "dev.nexus.app.MANDAR_AUDIO"
+        private const val PEDIDO_AUDIO = 7
 
         /** Liga/desliga o áudio do PC aqui; null se a conexão persistente não estiver ativa. */
         fun toggleAudio(): Boolean? = current?.audio?.let { val on = !it.playing; if (on) it.start() else it.stop(); on }

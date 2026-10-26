@@ -52,7 +52,9 @@ class AudioReceiver(private val ctx: Context, private val onStatus: (String?) ->
             val bytesPerMs = rate * 4 / 1000
             val track = AudioTrack.Builder()
                 .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                    // o áudio do PC não volta ao PC quando este aparelho também manda o dele (AudioSender)
+                    .setAllowedCapturePolicy(AudioAttributes.ALLOW_CAPTURE_BY_NONE).build())
                 .setAudioFormat(AudioFormat.Builder().setSampleRate(rate).setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                     .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO).build())
                 // buffer mínimo: ~metade do atraso; os cortes (underruns) aparecem na notificação

@@ -10,6 +10,7 @@ Repositórios de referência (Beamer, Coucou, Zorin Connect) e o commit estudado
 - **ChatGPT como orquestrador/revisor:** a conversa fica no Chrome, em https://chatgpt.com/c/6adcc434-05dc-83e8-9f0d-8d66687d6e59.
   - **Quando:** em cada marco ou decisão de arquitetura, mande uma consulta com o cabeçalho `Projeto | Fase | Consulta #ID | Objetivo | Contexto técnico | Tentativas/resultados | Restrições | Decisão necessária | Resultado esperado`, terminando com "Responda curto.".
   - **Numeração:** a última foi a **#013**; a próxima é a **#014**.
+  - **Pendente (#014):** não foi enviada porque a extensão do Chrome não estava conectada à conta pessoal. Assunto: áudio do aparelho → PC (AudioPlaybackCapture + `audio.push`, vários aparelhos mixados no PipeWire) e reorganização dos apps (abas no PC, barra inferior no Android, Preferências).
   - **Ler a resposta:** pegue o texto depois de "Responda curto." em `main.innerText`, em pedaços de até 2000 caracteres.
   - **Plano gratuito:** a conversa está longa, e o próprio ChatGPT avisa que perde detalhes.
 - **ia-local:** o modelo local Qwen (comando `ia`) inventou schemas inseguros na T02a. Código de segurança, protocolo e pareamento é escrito e revisado pelo Claude.

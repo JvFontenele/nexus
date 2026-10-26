@@ -33,6 +33,8 @@ SEEN_IDS = 1024  # ids lembrados por conexão para detectar replay
 # permissão no sentido inverso das ações: o PC pode controlar este dispositivo (padrão: desligada)
 INPUT_CONTROL = "input.control"
 INPUT_INJECT = "input.inject"  # este PC aceita ser controlado por aquele PC (padrão: desligada)
+AUDIO_IN = "audio.in"  # o dispositivo pode mandar o áudio dele para tocar neste PC (padrão: desligada)
+AUDIO_ASK = 120  # s em que um pedido do PC (audio.in.start) vale como permissão, uma vez
 TRANSPORTS = ("adb", "bluetooth")
 INPUT_DEAD = 2.5  # s sem frame do controlador: solta tudo e encerra
 SENT_HOME = 5.0   # s em que um PC mandado para casa não pode voltar
@@ -128,6 +130,9 @@ class Daemon:
         self.pending: dict[str, Conn] = {}
         self.pair_hits: dict[str, collections.deque] = {}
         self.audio_conn: Conn | None = None
+        self.audio_out_previous = None  # saída padrão de antes do "Nexus → …" (o áudio de volta não ecoa no aparelho)
+        self.audio_in: dict[str, Conn] = {}  # device_id → conexão audio.push: vários ao mesmo tempo
+        self.audio_in_asked: dict[str, float] = {}  # device_id → prazo monotônico do pedido do PC
         self.offers: dict[str, tuple[str, Path, float]] = {}  # id → (device_id, arquivo, prazo)
         self.transfers: dict[str, dict] = {}  # id → {"conn", "last"}: para progresso e cancelamento
         self.handshaking = 0
@@ -251,6 +256,9 @@ class Daemon:
             raise _Close()  # conexão só de dados, como a de áudio
         if t == "input.attach" and conn.hello is None:
             await self._input_attach(conn, rid)  # conexão só de entrada de outro PC
+            raise _Close()
+        if t == "audio.push" and conn.hello is None:
+            await self._audio_push(conn, body, rid)  # áudio do dispositivo para o PC, também só de dados
             raise _Close()
         if t == "audio.attach" and conn.hello is None:
             await self._audio(conn, rid)  # conexão só de áudio: não substitui a de controle
@@ -410,7 +418,7 @@ class Daemon:
     def allow(self, device_id_: str, action: str) -> dict:
         if device_id_ not in self.store.records:
             return {"ok": False, "error": "dispositivo não pareado"}
-        if action not in ("*phone_safe", INPUT_CONTROL, INPUT_INJECT):
+        if action not in ("*phone_safe", INPUT_CONTROL, INPUT_INJECT, AUDIO_IN):
             a = catalog.REGISTRY.get(action)
             if a is None or not a.phone_safe:
                 return {"ok": False, "error": "ação inexistente ou não phone_safe"}
@@ -493,6 +501,7 @@ class Daemon:
         except Exception as e:
             self.audio_conn = None
             raise ProtocolError("audio_failed", f"PipeWire: {type(e).__name__}")
+        self.audio_out_previous = previous
         proc = None
         log_event({"event": "audio.start", "device_id": conn.device_id})
         self.emit({"event": "audio.changed", "device_id": conn.device_id, "on": True})
@@ -514,6 +523,52 @@ class Daemon:
                 self.audio_conn = None
             log_event({"event": "audio.stop", "device_id": conn.device_id})
             self.emit({"event": "audio.changed", "device_id": conn.device_id, "on": False})
+
+    async def _audio_push(self, conn: Conn, body: dict, rid: str):
+        """Toca o áudio do dispositivo (frames binários dele) num fluxo próprio do PipeWire até a conexão cair."""
+        from nexus import audio
+        if conn.record is None:
+            raise ProtocolError("unauthorized", "dispositivo não pareado")
+        dev = conn.device_id
+        asked = self.audio_in_asked.pop(dev, 0) > time.monotonic()
+        if AUDIO_IN not in conn.record["permissions"] and not asked:
+            raise ProtocolError("forbidden", "este PC não recebe o áudio deste dispositivo")
+        if (body["rate"], body["channels"], body["format"]) != (audio.RATE, audio.CHANNELS, "s16le"):
+            raise ProtocolError("bad_format", "mande s16le, 48 kHz, estéreo")
+        old = self.audio_in.get(dev)
+        if old is not None:
+            old.writer.transport.abort()  # um fluxo por dispositivo: o novo assume
+        self.audio_in[dev] = conn
+        # o aparelho também ouve o PC: o áudio dele toca na saída de antes, senão voltaria para ele com atraso
+        # ponytail: decidido na partida; se o "Áudio aqui" ligar depois, o eco volta até reabrir este fluxo
+        target = self.audio_out_previous if self.audio_conn is not None and self.audio_conn.device_id == dev else None
+        proc = None
+        log_event({"event": "audio.in.start", "device_id": dev})
+        self.emit({"event": "audio.in.changed", "device_id": dev, "on": True})
+        try:
+            proc = await asyncio.create_subprocess_exec(*audio.playback_argv(conn.record["name"], dev[:12], target),
+                                                        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.DEVNULL,
+                                                        stderr=asyncio.subprocess.DEVNULL)
+            await conn.send(make("audio.ready", {"rate": audio.RATE, "channels": audio.CHANNELS, "format": "s16le"}, re=rid))
+            jitter = audio.Jitter()
+            while True:
+                n = framing.frame_length(await asyncio.wait_for(conn.reader.readexactly(4), IDLE))
+                chunk = await asyncio.wait_for(conn.reader.readexactly(n), IDLE)
+                if jitter.admit():
+                    proc.stdin.write(chunk)
+                    await asyncio.wait_for(proc.stdin.drain(), 5)
+        finally:
+            if proc is not None and proc.returncode is None:
+                proc.stdin.close()  # o pw-cat toca o resto e sai; se não sair, morre
+                try:
+                    await asyncio.wait_for(proc.wait(), 1)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+            if self.audio_in.get(dev) is conn:
+                del self.audio_in[dev]
+            log_event({"event": "audio.in.stop", "device_id": dev})
+            self.emit({"event": "audio.in.changed", "device_id": dev, "on": False})
 
     def _transfer_start(self, conn: Conn) -> dict:
         t = {"id": new_offer_id()[:16], "conn": conn, "last": 0.0}
@@ -1086,6 +1141,7 @@ class Daemon:
                                    "screen": r.get("screen"), "peer": True, "edge_on": r.get("edge_on", True)}
                                   for r in self.peers.records.values()],
                     "input": self._input_status(),
+                    "audio_in": sorted(self.audio_in),
                     "connected": sorted(self.by_device),
                     "audio": self.audio_conn.device_id if self.audio_conn else None}
         if cmd == "devices.revoke":
@@ -1167,6 +1223,20 @@ class Daemon:
                 return {"ok": False, "error": "dispositivo desconectado"}
             await conn.send(make(cmd, {}))  # o celular abre (ou fecha) a conexão de áudio
             return {"ok": True}
+        if cmd == "audio.in.start":  # o PC pede o áudio do dispositivo: ele mostra a confirmação do Android
+            dev_id = str(req.get("device_id"))
+            conn = self.by_device.get(dev_id)
+            if conn is None:
+                return {"ok": False, "error": "dispositivo desconectado"}
+            self.audio_in_asked[dev_id] = time.monotonic() + AUDIO_ASK
+            await conn.send(make("audio.in.start", {}))
+            return {"ok": True}
+        if cmd == "audio.in.stop":
+            c = self.audio_in.get(str(req.get("device_id")))
+            if c is not None:
+                # abort, não close: o close do TLS espera o close_notify do aparelho e o laço seguiria lendo
+                c.writer.transport.abort()  # o aparelho vê a conexão cair e para a captura
+            return {"ok": True}
         if cmd in ("send.text", "open.url"):
             return await self._push(cmd, req)
         if cmd == "devices.deny":
@@ -1176,6 +1246,8 @@ class Daemon:
             self.store.deny(dev_id, str(req.get("action")))
             if req.get("action") == INPUT_CONTROL:
                 await self._input_stop_for(dev_id)
+            if req.get("action") == AUDIO_IN and dev_id in self.audio_in:
+                self.audio_in[dev_id].writer.transport.abort()
             if req.get("action") == INPUT_INJECT and self.owner and self.owner["device_id"] == dev_id:
                 from nexus import kvmwire
                 await self._bye(self.owner, kvmwire.BYE_NOT_ALLOWED)

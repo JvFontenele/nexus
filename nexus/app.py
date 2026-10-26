@@ -190,7 +190,8 @@ def activity(device_id: str, limit: int = 6) -> list[tuple[str, str]]:
     import datetime
     from nexus.log import state_dir
     labels = {"file.received": "Arquivo recebido", "file.sent": "Arquivo enviado", "share.text": "Texto do dispositivo",
-              "send.text": "Texto enviado", "open.url": "Link aberto no dispositivo", "audio.start": "Áudio no dispositivo",
+              "send.text": "Texto enviado", "open.url": "Link aberto no dispositivo", "audio.start": "Áudio do PC no dispositivo",
+              "audio.in.start": "Áudio do dispositivo no PC",
               "pair.ok": "Pareado"}
     try:
         lines = (state_dir() / "events.jsonl").read_text().splitlines()[-400:]
@@ -277,7 +278,7 @@ class Window(Adw.ApplicationWindow):
             self.toast(f"Pareado com {ev.get('name', 'dispositivo')}" if ev.get("ok")
                        else f"Pareamento falhou: {ev.get('reason', '')}")
             self.refresh()
-        elif kind in ("device.connected", "device.disconnected", "audio.changed", "file.received"):
+        elif kind in ("device.connected", "device.disconnected", "audio.changed", "audio.in.changed", "file.received"):
             self.refresh()
         elif kind == "bt.confirm":
             self.ask_bt_confirm(ev)
@@ -319,7 +320,8 @@ class Window(Adw.ApplicationWindow):
         self.daemon.command({"cmd": "devices.list"}, got)
 
     def device(self, d: dict) -> dict:
-        return {**d, "connected": d["device_id"] in self.devs["connected"], "audio": self.devs.get("audio") == d["device_id"]}
+        return {**d, "connected": d["device_id"] in self.devs["connected"], "audio": self.devs.get("audio") == d["device_id"],
+                "audio_in": d["device_id"] in (self.devs.get("audio_in") or [])}
 
     # ── telas ────────────────────────────────────────────────────────────
     def render(self):
@@ -393,7 +395,7 @@ class Window(Adw.ApplicationWindow):
         if d.get("peer"):
             kind = "PC que este controla"
         state = "conectado" if d["connected"] else "fora da rede"
-        audio = " · áudio do PC tocando aqui" if d["audio"] else ""
+        audio = (" · recebendo o áudio do PC" if d["audio"] else "") + (" · mandando o áudio para o PC" if d["audio_in"] else "")
         texts.append(Gtk.Label(label=f"{kind} · {state}{audio}", xalign=0, css_classes=["nx-hero-sub"]))
         card.append(texts)
         self.content.append(card)
@@ -404,8 +406,11 @@ class Window(Adw.ApplicationWindow):
             ("video-display-symbolic", "Espelhar", "nx-blue", True, False,
              lambda: self.cmd({"cmd": "mirror", "device_id": dev})),
             ("audio-volume-muted-symbolic" if d["audio"] else "audio-speakers-symbolic",
-             "Parar áudio" if d["audio"] else "Áudio aqui", "nx-blue", on, d["audio"],
+             "Parar de mandar" if d["audio"] else "Mandar áudio", "nx-blue", on, d["audio"],
              lambda: self.cmd({"cmd": "audio.stop" if d["audio"] else "audio.start", "device_id": dev})),
+            ("audio-input-microphone-symbolic", "Parar de trazer" if d["audio_in"] else "Trazer áudio", "nx-blue",
+             on or d["audio_in"], d["audio_in"],
+             lambda: self.cmd({"cmd": "audio.in.stop" if d["audio_in"] else "audio.in.start", "device_id": dev})),
             ("input-mouse-symbolic", "Janela de controle", "nx-blue", "input.control" in d["permissions"], False,
              lambda: self.cmd({"cmd": "input.control", "device_id": dev})),
             ("document-send-symbolic", "Enviar arquivo", "nx-orange", on, False, lambda: self.pick_and_send(d)),
@@ -414,7 +419,8 @@ class Window(Adw.ApplicationWindow):
             ("insert-link-symbolic", "Abrir link", "nx-purple", on, False,
              lambda: self.ask_text(d, "Abrir link", "O dispositivo mostra uma notificação para abrir", "open.url", "url")),
         ]
-        grid = Gtk.Box(spacing=10, homogeneous=True)
+        grid = Gtk.FlowBox(homogeneous=True, column_spacing=10, row_spacing=10, min_children_per_line=2,
+                           max_children_per_line=len(controls), selection_mode=Gtk.SelectionMode.NONE)
         for icon, label, color, enabled, active, action in controls:
             box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, valign=Gtk.Align.CENTER)
             box.append(Gtk.Image(icon_name=icon, pixel_size=22, css_classes=[color]))
@@ -535,6 +541,16 @@ class Window(Adw.ApplicationWindow):
         # sentido inverso: o PC controla o dispositivo (scrcpy/adb); fica aqui para estar junto das outras chaves
         row = Gtk.Box(css_classes=["nx-row"])
         # um PC pareado aqui é quem controla: a chave é deixar ele controlar este PC (input.inject)
+        if d["kind"] != "pc":
+            label = "Mandar o áudio dele para tocar neste PC"
+            row.append(Gtk.Label(label=label, xalign=0, hexpand=True))
+            sw = Gtk.Switch(active="audio.in" in d["permissions"], valign=Gtk.Align.CENTER,
+                            tooltip_text="Sem isso, só quando você pede pelo botão Trazer áudio")
+            sw.update_property([Gtk.AccessibleProperty.LABEL], [label])
+            sw.connect("notify::active", self.toggle_permission, d["device_id"], "audio.in")
+            row.append(sw)
+            card.append(row)
+            row = Gtk.Box(css_classes=["nx-row"])
         perm = "input.inject" if d["kind"] == "pc" else "input.control"
         label = ("Controlar este PC com o teclado e o mouse dele" if perm == "input.inject"
                  else "Ser controlado pelo teclado e mouse deste PC")
