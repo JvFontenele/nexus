@@ -12,6 +12,8 @@ Tudo é próprio, sem KDE Connect nem Zorin Connect, cifrado de ponta a ponta e 
 **Áudio**
 - O som do PC toca no celular ou no tablet, com cerca de 115 ms de atraso.
 - O som dos apps do celular e do tablet toca no PC, **de vários aparelhos ao mesmo tempo**. O PipeWire mistura todos, e cada aparelho tem o próprio volume nas Configurações de som. O PC pergunta antes, com as opções de permitir uma vez, sempre ou negar.
+- O som do celular pode ir **direto para o tablet** (ou o contrário), passando pelo PC sem tocar nele e sem mudar a saída de som do PC.
+- Baixar o volume do aparelho não afeta o que toca no PC ou no outro aparelho.
 
 **Teclado e mouse**
 - Um teclado e um mouse para todos: o cursor atravessa a borda do monitor e passa a controlar o celular, o tablet ou outro PC. A ideia vem do [Beamer](https://github.com/kalkman-code/beamer).
@@ -21,6 +23,7 @@ Tudo é próprio, sem KDE Connect nem Zorin Connect, cifrado de ponta a ponta e 
 **Arquivos, texto e ações**
 - Arquivos nos dois sentidos, com progresso e cancelamento. Os recebidos vão para `~/Downloads/Nexus`.
 - Texto, área de transferência e links nos dois sentidos.
+- **Entre os aparelhos**, pelo PC: área de transferência, links e arquivos do celular para o tablet (ou o contrário), pelo cartão "Outros aparelhos" ou pelo menu Compartilhar. Quem recebe vê de onde veio ("Texto de POCO copiado").
 - O celular pode executar ações do PC liberadas uma a uma, como tocar/pausar, bloquear a tela e notificar. Nunca roda comandos do shell.
 - Espelhar a tela do celular no PC com [scrcpy](https://github.com/Genymobile/scrcpy).
 
@@ -44,7 +47,8 @@ Tudo é próprio, sem KDE Connect nem Zorin Connect, cifrado de ponta a ponta e 
 ## Segurança
 - Pareamento com código de 6 dígitos conferido nos dois lados (SAS com commit/reveal) e um certificado por aparelho.
 - TLS 1.3 com autenticação mútua. Quem decide se um aparelho é confiável é a lista de pareados (`trusted.json`), e cada aparelho pode ser revogado.
-- Permissões por aparelho, desligadas por padrão: ações remotas, ser controlado pelo teclado e mouse, mandar o próprio áudio ao PC.
+- Permissões por aparelho, desligadas por padrão: ações remotas, ser controlado pelo teclado e mouse, mandar o próprio áudio ao PC, mandar coisas aos outros aparelhos. Nas duas últimas, o PC pergunta a cada vez (Permitir, Sempre permitir, Negar) até você liberar de vez.
+- Entre aparelhos, o PC só repassa: não guarda o texto nem o link (arquivos ficam também em `~/Downloads/Nexus`), e o log registra só quem mandou para quem.
 - O log guarda só eventos, nunca conteúdo.
 - Nada pede root. A porta 47210/tcp fica aberta só para a rede local e para a tailnet.
 
@@ -70,7 +74,7 @@ No HyperOS, na One UI e em outros sistemas que fecham apps em segundo plano, lib
 1. No app do celular, toque em **Procurar** e depois em **Parear**.
 2. Confira o código no PC (no notch, no app Nexus ou com `nexus pair confirm <id>`) e no celular.
 3. No app Nexus do PC, cada aparelho tem três abas: **Início** (ações), **Teclado e mouse** (borda e posição) e **Permissões**. As opções gerais ficam em ☰ → **Preferências** (Ctrl+,).
-4. No celular, a barra inferior tem **Início**, **Áudio**, **Arquivos** e **Ajustes**.
+4. No celular, a barra inferior tem **Início**, **Áudio**, **Arquivos** e **Ajustes**. Em Início, o cartão **Outros aparelhos** manda área de transferência, arquivo ou áudio para outro celular ou tablet pareado com o mesmo PC.
 
 Linha de comando: `nexus devices`, `nexus pair`, `nexus mirror`, `nexus control`, `nexus peer`, `nexus agents`, `nexus app`. Use `nexus --help` para ver todos.
 
