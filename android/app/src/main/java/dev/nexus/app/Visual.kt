@@ -239,7 +239,7 @@ private fun DrawScope.desenharNexo(expr: String, abertura: Float, sx: Float, sy:
     }, CORACAO.copy(alpha = a))
 }
 
-enum class Icone { ESPELHAR, AUDIO, CLIPBOARD, ARQUIVO, AJUSTES }
+enum class Icone { INICIO, ESPELHAR, AUDIO, CLIPBOARD, ARQUIVO, AJUSTES }
 
 /** Ícones de traço do design (viewBox 24×24), sem depender de biblioteca de ícones. */
 @Composable
@@ -256,6 +256,9 @@ private fun DrawScope.desenharIcone(icone: Icone, cor: Color) {
         drawPath(path, cor, style = t)
     }
     when (icone) {
+        Icone.INICIO -> {
+            linha(3f, 11f, 12f, 4f, 21f, 11f); linha(5f, 9.5f, 5f, 20f, 19f, 20f, 19f, 9.5f); linha(10f, 20f, 10f, 14f, 14f, 14f, 14f, 20f)
+        }
         Icone.ESPELHAR -> {
             drawRoundRect(cor, Offset(2f, 4f), Size(20f, 13f), CornerRadius(2f, 2f), style = t)
             linha(8f, 21f, 16f, 21f); linha(12f, 17f, 12f, 21f)

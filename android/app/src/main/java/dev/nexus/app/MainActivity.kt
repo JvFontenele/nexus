@@ -1,5 +1,6 @@
 package dev.nexus.app
 
+import android.app.DownloadManager
 import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.Context
@@ -51,9 +52,11 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
@@ -82,6 +85,8 @@ import java.util.concurrent.CompletableFuture
 import kotlin.concurrent.thread
 import kotlinx.coroutines.delay
 
+private val ABAS = listOf("Início" to Icone.INICIO, "Áudio" to Icone.AUDIO, "Arquivos" to Icone.ARQUIVO, "Ajustes" to Icone.AJUSTES)
+
 class MainActivity : ComponentActivity() {
     private val prefs by lazy { getSharedPreferences("nexus", Context.MODE_PRIVATE) }
     private var host by mutableStateOf("")
@@ -106,14 +111,13 @@ class MainActivity : ComponentActivity() {
     private val pedirMicrofone = registerForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
         if (ok) pedirConfirmacao() else status = "Sem a permissão de áudio, o Android não deixa capturar o som dos apps"
     }
-    private var settings by mutableStateOf(false)
+    private var aba by mutableStateOf(0) // Início, Áudio, Arquivos, Ajustes
     private var pending by mutableStateOf<Pair<String, String>?>(null) // código, fp do PC
     private var decision: CompletableFuture<Boolean>? = null
     private var actions by mutableStateOf<List<RemoteAction>>(emptyList())
     private var controlado by mutableStateOf(false)
     private var autoclique by mutableStateOf(false)
     private var bateriaLivre by mutableStateOf(true)
-    private var guia by mutableStateOf(false)
     private var tecladoBt by mutableStateOf(false)
     private var layoutEscolhido by mutableStateOf(false)
 
@@ -142,6 +146,7 @@ class MainActivity : ComponentActivity() {
     private fun pedidoDoPc(intent: Intent?) {
         if (intent?.action != LinkService.ACTION_MANDAR_AUDIO) return
         intent.action = null // girar a tela não pede de novo
+        aba = 1
         if (!LinkService.audioSending()) toggleAudioOut()
     }
 
@@ -256,7 +261,7 @@ class MainActivity : ComponentActivity() {
         prefs.edit().remove("pin").apply()
         pin = null
         actions = emptyList()
-        settings = false
+        aba = 0
         status = "Pareamento apagado no celular. Revogue também no PC."
     }
 
@@ -335,7 +340,7 @@ class MainActivity : ComponentActivity() {
         when {
             p != null -> Pareamento(p.first, p.second)
             pin == null -> BoasVindas()
-            else -> Inicio()
+            else -> Principal()
         }
     }
 
@@ -400,86 +405,151 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun Inicio() {
+    private fun Principal() {
         val pick = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { sendFiles(it) }
+        val escolher = { pick.launch(arrayOf("*/*")) }
+        val rolagem = rememberScrollState()
+        LaunchedEffect(aba) { rolagem.scrollTo(0) }
+        Column(Modifier.fillMaxSize()) {
+            Column(Modifier.weight(1f).fillMaxWidth().statusBarsPadding().padding(horizontal = 18.dp, vertical = 16.dp)
+                .verticalScroll(rolagem), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                Text(if (aba == 0) "Nexus" else ABAS[aba].first, fontSize = 26.sp, fontWeight = FontWeight.Bold)
+                when (aba) {
+                    0 -> AbaInicio(escolher)
+                    1 -> AbaAudio()
+                    2 -> AbaArquivos(escolher)
+                    else -> AbaAjustes()
+                }
+                Status()
+            }
+            NavigationBar(containerColor = Cores.superficie) {
+                ABAS.forEachIndexed { i, (nome, icone) ->
+                    NavigationBarItem(aba == i, { aba = i }, icon = { IconeTraco(icone, if (aba == i) Cores.acentoEscuro else Cores.apagado) },
+                        label = { Text(nome) }, colors = NavigationBarItemDefaults.colors(indicatorColor = Cores.acento,
+                            selectedTextColor = Cores.texto, unselectedTextColor = Cores.apagado))
+                }
+            }
+        }
+    }
+
+    @Composable
+    private fun AbaInicio(escolher: () -> Unit) {
         val expr = when {
             !linked -> "dormindo"
             !linkUp -> "preocupado"
-            audioOn -> "curtindo"
+            audioOn || audioOutOn -> "curtindo"
             else -> "conectado"
         }
-        Column(Modifier.fillMaxSize().statusBarsPadding().padding(horizontal = 18.dp, vertical = 16.dp)
-            .verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(14.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("Nexus", fontSize = 26.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                IconButton({ settings = !settings }, Modifier.size(44.dp).background(Cores.superficie, CircleShape)
-                    .semantics { contentDescription = "Configurações da conexão" }) {
-                    IconeTraco(Icone.AJUSTES, Cores.texto, 20.dp)
-                }
-            }
-
-            Cartao {
-                Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
-                        Nexo(expr, 76.dp, if (linkUp) "Nexo conectado" else "Nexo $expr: desconectado", FileTransfer.concluidas)
-                        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                            Text(pcName, fontSize = 18.sp, fontWeight = FontWeight.Bold)
-                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                Box(Modifier.size(8.dp).background(if (linkUp) Cores.verde else Color(0xFF6B6F7A), CircleShape))
-                                Text(if (linkUp) "Conectado" else if (linked) "Conectando…" else "Desconectado",
-                                    color = Color(0xFFB9BCC6), fontSize = 13.sp)
-                            }
+        Cartao {
+            Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+                    Nexo(expr, 76.dp, if (linkUp) "Nexo conectado" else "Nexo $expr: desconectado", FileTransfer.concluidas)
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(pcName, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Box(Modifier.size(8.dp).background(if (linkUp) Cores.verde else Color(0xFF6B6F7A), CircleShape))
+                            Text(if (linkUp) "Conectado" else if (linked) "Conectando…" else "Desconectado",
+                                color = Color(0xFFB9BCC6), fontSize = 13.sp)
                         }
                     }
-                    Row(Modifier.fillMaxWidth().background(Cores.superficie2, RoundedCornerShape(16.dp))
-                        .padding(horizontal = 14.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Text("Manter conectado", Modifier.weight(1f))
-                        Switch(linked, ::toggleLink, colors = SwitchDefaults.colors(checkedTrackColor = Cores.acento))
-                    }
-                    if (linked) OutlinedButton({ guia = !guia }, Modifier.fillMaxWidth().heightIn(min = 44.dp),
-                        border = BorderStroke(1.5.dp, Cores.borda)) {
-                        Text(if (bateriaLivre) "Manter o Nexus ligado" else "Manter o Nexus ligado · falta liberar", fontSize = 14.sp)
-                    }
+                }
+                Row(Modifier.fillMaxWidth().background(Cores.superficie2, RoundedCornerShape(16.dp))
+                    .padding(horizontal = 14.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text("Manter conectado", Modifier.weight(1f))
+                    Switch(linked, ::toggleLink, colors = SwitchDefaults.colors(checkedTrackColor = Cores.acento))
+                }
+                if (linked && !bateriaLivre) OutlinedButton({ aba = 3 }, Modifier.fillMaxWidth().heightIn(min = 44.dp),
+                    border = BorderStroke(1.5.dp, Cores.borda)) {
+                    Text("Manter o Nexus ligado · falta liberar", fontSize = 14.sp)
                 }
             }
+        }
+        Aparece(controlado) { Cartao { Controle() } }
+        Aparece(tecladoBt && !layoutEscolhido) { Cartao { LayoutTeclado() } }
+        FileTransfer.ativas.forEach { t -> key(t.id) { Cartao { Transferindo(t) } } }
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Bloco(Icone.ESPELHAR, Cores.azulClaro, "Espelhar no PC", null, false, true, Modifier.weight(1f), ::mirror)
+            Bloco(Icone.ARQUIVO, Cores.laranja, "Enviar arquivo", null, false, true, Modifier.weight(1f), escolher)
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Bloco(Icone.CLIPBOARD, Cores.verdeClaro, "Enviar área de transferência", null, false, true, Modifier.weight(1f),
+                ::sendClipboard)
+        }
+        if (actions.isNotEmpty()) Cartao { ControlarPc() }
+    }
 
-            Aparece(linked && guia) { Cartao { ManterLigado() } }
-            Aparece(controlado) { Cartao { Controle() } }
-            Aparece(tecladoBt && !layoutEscolhido) { Cartao { LayoutTeclado() } }
-            FileTransfer.ativas.forEach { t -> key(t.id) { Cartao { Transferindo(t) } } }
+    @Composable
+    private fun AbaAudio() {
+        CartaoAudio("Áudio do PC aqui", "O som do PC toca neste aparelho.",
+            if (audioOn) audioText?.removePrefix("Áudio do PC · ") else null, audioOn, linkUp, ::toggleAudio)
+        CartaoAudio("Áudio daqui no PC", "O som dos apps deste aparelho toca no PC. O Android pede confirmação a cada vez.",
+            if (audioOutOn) "Tocando no PC" else audioOutText, audioOutOn, linkUp || audioOutOn, ::toggleAudioOut)
+        Text(if (linkUp) "Baixe o volume deste aparelho: o PC continua tocando."
+            else "Ligue \"Manter conectado\" no Início para usar o áudio.", color = Cores.apagado, fontSize = 13.sp)
+    }
 
-            Aparece(settings) { Cartao {
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    OutlinedTextField(host, { host = it }, label = { Text("IP do PC") }, singleLine = true, enabled = !busy,
-                        modifier = Modifier.fillMaxWidth())
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedButton(::discover, enabled = !busy) { Text("Procurar") }
-                        Button(::startPing, enabled = !busy && host.isNotBlank()) { Text("Testar") }
-                    }
-                    Text("PC ${pin!!.take(16)}…", color = Color(0xFF8E929D), fontSize = 12.sp)
-                    OutlinedButton(::forget, enabled = !busy, border = BorderStroke(1.dp, Color(0xFF5A3A36))) {
-                        Text("Esquecer este PC", color = Color(0xFFFF9B8E))
-                    }
+    @Composable
+    private fun CartaoAudio(titulo: String, explica: String, sub: String?, ativo: Boolean, habilitado: Boolean, acao: () -> Unit) {
+        Cartao {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+                IconeTraco(Icone.AUDIO, if (ativo) Cores.acento else if (habilitado) Cores.azulClaro else Color(0xFF6B6F7A), 30.dp)
+                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text(titulo, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                    Text(explica, color = Cores.apagado, fontSize = 13.sp)
+                    if (sub != null) Text(sub, color = if (ativo) Cores.verde else Cores.laranja, fontSize = 13.sp)
                 }
-            } }
+                Switch(ativo, { acao() }, enabled = habilitado && !busy,
+                    colors = SwitchDefaults.colors(checkedTrackColor = Cores.acento),
+                    modifier = Modifier.semantics { contentDescription = titulo })
+            }
+        }
+    }
 
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                Bloco(Icone.AUDIO, Cores.azulClaro, "Áudio do PC aqui", if (audioOn) audioText?.removePrefix("Áudio do PC · ") else null,
-                    audioOn, linkUp, Modifier.weight(1f), ::toggleAudio)
-                Bloco(Icone.AUDIO, Cores.verdeClaro, "Áudio daqui no PC", if (audioOutOn) "tocando no PC" else audioOutText,
-                    audioOutOn, linkUp || audioOutOn, Modifier.weight(1f), ::toggleAudioOut)
+    @Composable
+    private fun AbaArquivos(escolher: () -> Unit) {
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Bloco(Icone.ARQUIVO, Cores.laranja, "Enviar arquivo", null, false, true, Modifier.weight(1f), escolher)
+            Bloco(Icone.CLIPBOARD, Cores.verdeClaro, "Enviar área de transferência", null, false, true, Modifier.weight(1f),
+                ::sendClipboard)
+        }
+        FileTransfer.ativas.forEach { t -> key(t.id) { Cartao { Transferindo(t) } } }
+        Cartao {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("Recebidos do PC", fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                Text("Ficam em Download/Nexus.", color = Cores.apagado, fontSize = 13.sp)
+                OutlinedButton({ abrir(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS)) },
+                    border = BorderStroke(1.5.dp, Cores.borda)) { Text("Abrir recebidos") }
             }
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                Bloco(Icone.ESPELHAR, Cores.azulClaro, "Espelhar no PC", null, false, true, Modifier.weight(1f), ::mirror)
-                Bloco(Icone.ARQUIVO, Cores.laranja, "Enviar arquivo", null, false, true, Modifier.weight(1f)) { pick.launch(arrayOf("*/*")) }
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                Bloco(Icone.CLIPBOARD, Cores.verdeClaro, "Enviar área de transferência", null, false, true, Modifier.weight(1f),
-                    ::sendClipboard)
-            }
+        }
+    }
 
-            if (actions.isNotEmpty()) Cartao { ControlarPc() }
-            Status()
+    @Composable
+    private fun AbaAjustes() {
+        Cartao {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("PC pareado: $pcName", fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                OutlinedTextField(host, { host = it }, label = { Text("IP do PC") }, singleLine = true, enabled = !busy,
+                    modifier = Modifier.fillMaxWidth())
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(::discover, enabled = !busy) { Text("Procurar") }
+                    Button(::startPing, enabled = !busy && host.isNotBlank()) { Text("Testar") }
+                }
+                Text("PC ${pin!!.take(16)}…", color = Color(0xFF8E929D), fontSize = 12.sp)
+                OutlinedButton(::forget, enabled = !busy, border = BorderStroke(1.dp, Color(0xFF5A3A36))) {
+                    Text("Esquecer este PC", color = Color(0xFFFF9B8E))
+                }
+            }
+        }
+        Cartao { ManterLigado() }
+        Cartao { LayoutTeclado() }
+        Cartao {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text("Sobre", fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                Text("Nexus ${runCatching { packageManager.getPackageInfo(packageName, 0).versionName }.getOrNull() ?: ""}",
+                    fontSize = 14.sp)
+                Text("Integração PC ↔ Android, cifrada e sem nuvem. Software livre, GPL-3.0.", color = Cores.apagado,
+                    fontSize = 13.sp)
+            }
         }
     }
 

@@ -567,6 +567,17 @@ class TestDaemon(unittest.TestCase):
         u.send("audio.attach", {})
         self.assertEqual(u.recv()["body"]["code"], "unauthorized")
 
+    def test_rename(self):
+        self.pair()
+        cmd = lambda **req: self.call(self.d._control_cmd(req))
+        name = lambda: next(d for d in cmd(cmd="devices.list")["devices"] if d["device_id"] == self.fp_phone)["name"]
+        self.assertTrue(cmd(cmd="devices.rename", device_id=self.fp_phone, name="  POCO   X5 Pro  ")["ok"])
+        self.assertEqual(name(), "POCO X5 Pro")
+        self.assertEqual(self.d.store.records[self.fp_phone]["name"], "teste")  # o nome do aparelho fica guardado
+        self.assertTrue(cmd(cmd="devices.rename", device_id=self.fp_phone, name="")["ok"])
+        self.assertEqual(name(), "teste")  # vazio volta ao nome do aparelho
+        self.assertFalse(cmd(cmd="devices.rename", device_id="x" * 64, name="a")["ok"])
+
     def test_audio_push(self):
         import struct as st
         import sys

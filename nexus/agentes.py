@@ -135,6 +135,15 @@ def comando_hook() -> str:
     return f"{shlex.quote(sys.executable)} -P {shlex.quote(str(Path(__file__).resolve()))} hook"
 
 
+def instalado(config_dir: Path) -> bool:
+    """O hook do Nexus está no settings.json desta pasta de configuração do Claude Code."""
+    try:
+        config = json.loads((config_dir / "settings.json").read_text(encoding="utf-8"))
+        return mesclar(config, comando_hook()) == config
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 def mesclar(config: dict, comando: str) -> dict:
     """Cópia de config com o hook PermissionRequest do Nexus; não apaga nem altera nada que já existe."""
     novo = json.loads(json.dumps(config))

@@ -207,6 +207,7 @@ class TestInstalar(unittest.TestCase):
 
     def test_diff_sem_gravar_depois_grava_com_backup(self):
         antes = self.cfg.read_text()
+        self.assertFalse(agentes.instalado(self.dir))
         self.assertEqual(self.instalar(False), 0)
         self.assertEqual(self.cfg.read_text(), antes)
         self.assertIn('+    "PermissionRequest": [', self.saidas[0])
@@ -217,6 +218,7 @@ class TestInstalar(unittest.TestCase):
         self.assertEqual(novo["model"], "opus")
         [grupo] = novo["hooks"]["PermissionRequest"]
         self.assertEqual(grupo["hooks"][0]["command"], agentes.comando_hook())
+        self.assertTrue(agentes.instalado(self.dir))
         self.saidas.clear()
         self.assertEqual(self.instalar(True), 0)  # idempotente
         self.assertIn("já está instalado", self.saidas[0])

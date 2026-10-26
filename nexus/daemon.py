@@ -1150,12 +1150,14 @@ class Daemon:
         if cmd == "pair.confirm":
             return await self.confirm(str(req.get("pid")), bool(req.get("accept")))
         if cmd == "devices.list":
-            return {"ok": True, "devices": [{**{k: r[k] for k in ("device_id", "name", "kind", "paired_at", "permissions")},
+            return {"ok": True, "devices": [{**{k: r[k] for k in ("device_id", "kind", "paired_at", "permissions")},
+                                             "name": r.get("alias") or r["name"],
                                              "arrangement": r.get("arrangement"), "screen": r.get("screen"),
                                              "transport": r.get("transport", "adb"), "bt_address": r.get("bt_address"),
                                              "edge_on": r.get("edge_on", True)}
                                             for r in self.store.records.values()]
-                               + [{"device_id": r["device_id"], "name": r["name"], "kind": "pc", "paired_at": r["paired_at"],
+                               + [{"device_id": r["device_id"], "name": r.get("alias") or r["name"], "kind": "pc",
+                                   "paired_at": r["paired_at"],
                                    "permissions": [INPUT_CONTROL], "arrangement": r.get("arrangement"),
                                    "screen": r.get("screen"), "peer": True, "edge_on": r.get("edge_on", True)}
                                   for r in self.peers.records.values()],
@@ -1258,6 +1260,13 @@ class Daemon:
             return {"ok": True}
         if cmd in ("send.text", "open.url"):
             return await self._push(cmd, req)
+        if cmd == "devices.rename":  # apelido local; o nome que o aparelho manda no hello continua guardado
+            store, rec = self._target(str(req.get("device_id")))
+            name = " ".join(str(req.get("name", "")).split())[:40]
+            if rec is None:
+                return {"ok": False, "error": "dispositivo não pareado"}
+            store.update(rec["device_id"], "alias", name or None)
+            return {"ok": True}
         if cmd == "devices.deny":
             dev_id = str(req.get("device_id"))
             if dev_id not in self.store.records:

@@ -45,7 +45,6 @@ window.nexus, .nx-bg { background-color: #0B0C10; color: #EDEEF2; }
 .nx-device-status { font-size: 0.85em; color: #A7AAB4; }
 .nx-device-status.on { color: #9FE3C1; }
 .nx-pair-btn { border-radius: 12px; border: 1.5px dashed #3E4352; background: none; min-height: 44px; }
-.nx-foot { font-size: 0.85em; color: #8E929D; }
 .nx-card { background-color: #16181D; border-radius: 22px; padding: 18px; }
 .nx-hero-name { font-size: 1.7em; font-weight: 700; }
 .nx-hero-sub { color: #B9BCC6; }
@@ -232,7 +231,16 @@ class Window(Adw.ApplicationWindow):
 
         self.toasts = Adw.ToastOverlay()
         view = Adw.ToolbarView()
-        view.add_top_bar(Adw.HeaderBar())
+        header = Adw.HeaderBar()
+        menu = Gio.Menu()
+        menu.append("Preferências", "win.preferences")
+        menu.append("Sobre o Nexus", "win.about")
+        header.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu, tooltip_text="Menu"))
+        view.add_top_bar(header)
+        for name, fn in (("preferences", self.show_preferences), ("about", self.show_about)):
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", lambda *_a, fn=fn: fn())
+            self.add_action(action)
         self.banner = Adw.Banner(button_label="Cancelar")  # progresso de arquivo (o notch mostra o mesmo)
         self.banner.connect("button-clicked", lambda _b: self.transfer and self.cmd({"cmd": "file.cancel", "id": self.transfer}))
         view.add_top_bar(self.banner)
@@ -246,7 +254,7 @@ class Window(Adw.ApplicationWindow):
         side_wrap.append(self.side)
         self.content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18, margin_top=22, margin_bottom=22,
                                margin_start=26, margin_end=26, hexpand=True)
-        scroll = Gtk.ScrolledWindow(hexpand=True, child=self.content)
+        scroll = Gtk.ScrolledWindow(hexpand=True, child=Adw.Clamp(maximum_size=1100, child=self.content))
         body.append(side_wrap)
         body.append(scroll)
         self.stack = Gtk.Stack()
@@ -257,6 +265,7 @@ class Window(Adw.ApplicationWindow):
         self.set_content(self.toasts)
 
         self.selected = None
+        self.tab = "inicio"  # aba da página do dispositivo, mantida entre os redesenhos
         self.devs, self.actions, self.info = {"devices": [], "connected": []}, [], {}
         self.shown_pairings = set()
         self.screen_asked = set()
@@ -344,15 +353,25 @@ class Window(Adw.ApplicationWindow):
             return
         self.render_hero(d)
         if d.get("peer"):  # PC que este controla: só o arranjo e a borda
-            self.render_input(d)
+            self.render_input(d, self.content)
             return
-        self.render_controls(d)
+        stack = Adw.ViewStack(vhomogeneous=False, hhomogeneous=False)
+        home = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+        self.render_controls(d, home)
+        home.append(self.render_activity(d))
+        stack.add_titled_with_icon(home, "inicio", "Início", "go-home-symbolic")
+        keys = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
         if "input.control" in d["permissions"]:
-            self.render_input(d)
-        cols = Gtk.Box(spacing=14, homogeneous=True, vexpand=True)
-        cols.append(self.render_permissions(d))
-        cols.append(self.render_activity(d))
-        self.content.append(cols)
+            self.render_input(d, keys)
+        else:
+            keys.append(Adw.StatusPage(icon_name="input-mouse-symbolic", title="Teclado e mouse desligados",
+                                       description="Em Permissões, ligue \"Ser controlado pelo teclado e mouse deste PC\"."))
+        stack.add_titled_with_icon(keys, "entrada", "Teclado e mouse", "input-keyboard-symbolic")
+        stack.add_titled_with_icon(self.render_permissions(d), "permissoes", "Permissões", "security-medium-symbolic")
+        stack.set_visible_child_name(self.tab)
+        stack.connect("notify::visible-child-name", lambda st, _p: setattr(self, "tab", st.get_visible_child_name()))
+        self.content.append(Adw.ViewSwitcher(stack=stack, policy=Adw.ViewSwitcherPolicy.WIDE, halign=Gtk.Align.START))
+        self.content.append(stack)
 
     def render_side(self, devices: list[dict]):
         child = self.side.get_first_child()
@@ -379,19 +398,19 @@ class Window(Adw.ApplicationWindow):
         pair.set_child(Gtk.Label(label="+  Parear dispositivo"))
         pair.connect("clicked", lambda _b: self.explain_pairing())
         self.side.append(pair)
-        spacer = Gtk.Box(vexpand=True)
-        self.side.append(spacer)
-        listen = ", ".join(self.info.get("listen", []))
-        foot = Gtk.Label(label=f"Este PC: {self.info.get('device_id', '')[:8]}…\n{listen}", xalign=0, wrap=True,
-                         css_classes=["nx-foot"], margin_start=10)
-        self.side.append(foot)
 
     def render_hero(self, d: dict):
         from nexus import mascote
         card = Gtk.Box(spacing=20, css_classes=["nx-card"])
         card.append(mascot_area(110, 87, lambda: mascote.expressao(d)))
         texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, valign=Gtk.Align.CENTER)
-        texts.append(Gtk.Label(label=d["name"], xalign=0, css_classes=["nx-hero-name"]))
+        title = Gtk.Box(spacing=6)
+        title.append(Gtk.Label(label=d["name"], xalign=0, css_classes=["nx-hero-name"]))
+        edit = Gtk.Button(icon_name="document-edit-symbolic", css_classes=["flat", "circular"], valign=Gtk.Align.CENTER,
+                          tooltip_text="Renomear")
+        edit.connect("clicked", lambda _b: self.ask_rename(d))
+        title.append(edit)
+        texts.append(title)
         kind = {"phone": "Celular", "tablet": "Tablet", "pc": "PC"}.get(d["kind"], d["kind"])
         if d.get("peer"):
             kind = "PC que este controla"
@@ -401,7 +420,7 @@ class Window(Adw.ApplicationWindow):
         card.append(texts)
         self.content.append(card)
 
-    def render_controls(self, d: dict):
+    def render_controls(self, d: dict, parent: Gtk.Box):
         dev, on = d["device_id"], d["connected"]
         controls = [
             ("video-display-symbolic", "Espelhar", "nx-blue", True, False,
@@ -431,9 +450,9 @@ class Window(Adw.ApplicationWindow):
             b.update_property([Gtk.AccessibleProperty.LABEL], [label])
             b.connect("clicked", lambda _b, a=action: a())
             grid.append(b)
-        self.content.append(grid)
+        parent.append(grid)
 
-    def render_input(self, d: dict):
+    def render_input(self, d: dict, parent: Gtk.Box):
         """Travessia pela borda: o arranjo e o botão "Ativar borda"."""
         dev = d["device_id"]
         state = self.devs.get("input") or {}
@@ -483,7 +502,7 @@ class Window(Adw.ApplicationWindow):
             self.screen_asked.add(dev)
             self.daemon.command({"cmd": "input.screen", "device_id": dev},
                                 lambda r: r.get("screen") != d.get("screen") and self.refresh())
-        self.content.append(card)
+        parent.append(card)
 
     def render_transport(self, d: dict) -> Gtk.Widget:
         """Como a entrada chega ao aparelho: adb/UHID (padrão) ou Bluetooth LE (ADR-0006)."""
@@ -562,7 +581,7 @@ class Window(Adw.ApplicationWindow):
         row.append(sw)
         card.append(row)
         revoke = Gtk.Button(label="Revogar este dispositivo…", css_classes=["flat", "nx-danger"], halign=Gtk.Align.START,
-                            valign=Gtk.Align.END, vexpand=True, margin_top=8)
+                            margin_top=8)
         revoke.connect("clicked", lambda _b: self.confirm_revoke(d))
         card.append(revoke)
         return card
@@ -579,8 +598,7 @@ class Window(Adw.ApplicationWindow):
             row.append(Gtk.Label(label=when, css_classes=["nx-muted"]))
             card.append(row)
         from nexus.files import download_dir
-        folder = Gtk.LinkButton(uri=download_dir().as_uri(), label="Abrir a pasta de recebidos", halign=Gtk.Align.START,
-                                valign=Gtk.Align.END, vexpand=True)
+        folder = Gtk.LinkButton(uri=download_dir().as_uri(), label="Abrir a pasta de recebidos", halign=Gtk.Align.START)
         card.append(folder)
         return card
 
@@ -621,6 +639,73 @@ class Window(Adw.ApplicationWindow):
                             lambda r: (self.refresh() if action == "input.control" else None) if r.get("ok")
                             else self.toast(r.get("error", "falhou")))  # o botão "Controlar" depende dessa chave
 
+    def ask_rename(self, d: dict):
+        dlg = Adw.AlertDialog(heading="Renomear", body="Só neste PC. Vazio volta ao nome que o aparelho manda.")
+        entry = Gtk.Entry(text=d["name"], activates_default=True, max_length=40)
+        dlg.set_extra_child(entry)
+        dlg.add_response("cancel", "Cancelar")
+        dlg.add_response("save", "Salvar")
+        dlg.set_response_appearance("save", Adw.ResponseAppearance.SUGGESTED)
+        dlg.set_default_response("save")
+        dlg.connect("response", lambda _d, r: r == "save" and self.daemon.command(
+            {"cmd": "devices.rename", "device_id": d["device_id"], "name": entry.get_text()},
+            lambda resp: self.refresh() if resp.get("ok") else self.toast(resp.get("error", "falhou"))))
+        dlg.present(self)
+
+    def show_preferences(self):
+        from pathlib import Path
+        from nexus import agentes
+        from nexus.files import download_dir
+        dlg = Adw.PreferencesDialog(title="Preferências")
+        page = Adw.PreferencesPage(title="Geral", icon_name="preferences-system-symbolic")
+        group = Adw.PreferencesGroup(title="Inicialização")
+        row = Adw.SwitchRow(title="Iniciar o Nexus com a sessão", subtitle="O serviço nexusd sobe ao entrar no GNOME",
+                            active=_systemctl("is-enabled") == 0)
+        row.connect("notify::active", lambda r, _p: _systemctl("enable" if r.get_active() else "disable") == 0
+                    or self.toast("O systemctl recusou"))
+        group.add(row)
+        page.add(group)
+
+        group = Adw.PreferencesGroup(title="Arquivos")
+        row = Adw.ActionRow(title="Pasta de recebidos", subtitle=str(download_dir()))
+        opener = Gtk.Button(label="Abrir", valign=Gtk.Align.CENTER)
+        opener.connect("clicked", lambda _b: (download_dir().mkdir(parents=True, exist_ok=True),
+                                              Gio.AppInfo.launch_default_for_uri(download_dir().as_uri(), None)))
+        row.add_suffix(opener)
+        group.add(row)
+        page.add(group)
+
+        group = Adw.PreferencesGroup(title="Claude Code", description=(
+            "Aprovar os pedidos de permissão pelo notch. Para instalar numa pasta, rode no terminal: "
+            "nexus agents install --config-dir PASTA"))
+        for folder in (Path.home() / ".claude", Path.home() / ".claude-pessoal"):
+            if folder.is_dir():
+                group.add(Adw.ActionRow(title="~/" + folder.name, subtitle="instalado" if agentes.instalado(folder)
+                                        else "não instalado"))
+        page.add(group)
+
+        group = Adw.PreferencesGroup(title="Este PC")
+        group.add(Adw.ActionRow(title="Nome", subtitle=GLib.get_host_name()))
+        fp = self.info.get("device_id", "")
+        row = Adw.ActionRow(title="Identidade", subtitle=f"{fp[:16]}…", subtitle_selectable=True)
+        copy = Gtk.Button(icon_name="edit-copy-symbolic", css_classes=["flat"], valign=Gtk.Align.CENTER,
+                          tooltip_text="Copiar a identidade inteira")
+        copy.connect("clicked", lambda _b: (self.get_clipboard().set(fp), self.toast("Identidade copiada")))
+        row.add_suffix(copy)
+        group.add(row)
+        group.add(Adw.ActionRow(title="Endereços", subtitle=f"{', '.join(self.info.get('listen', []))} · porta "
+                                                            f"{self.info.get('port', '')}", subtitle_selectable=True))
+        page.add(group)
+        dlg.add(page)
+        dlg.present(self)
+
+    def show_about(self):
+        import nexus
+        Adw.AboutDialog(application_name="Nexus", application_icon=APP_ID, version=nexus.__version__,
+                        developer_name="João Victor", license_type=Gtk.License.GPL_3_0,
+                        website="https://github.com/JvFontenele/nexus",
+                        comments="Integração própria e cifrada entre o PC e o Android").present(self)
+
     def confirm_revoke(self, d: dict):
         dlg = Adw.AlertDialog(heading=f"Revogar {d['name']}?",
                               body="O dispositivo perde o acesso agora e precisa parear de novo.")
@@ -660,11 +745,22 @@ class Window(Adw.ApplicationWindow):
         dlg.present(self)
 
 
+def _systemctl(verb: str) -> int:
+    """systemctl --user VERBO nexusd (argumentos fixos): 0 = deu certo / está habilitado."""
+    import subprocess
+    try:
+        return subprocess.run(["systemctl", "--user", verb, "nexusd"], capture_output=True, timeout=10).returncode
+    except (subprocess.SubprocessError, OSError):
+        return 1
+
+
 class App(Adw.Application):
     def __init__(self):
         super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
 
     def do_activate(self):
+        Gtk.Window.set_default_icon_name(APP_ID)  # o SVG instalado por packaging/install.sh
+        self.set_accels_for_action("win.preferences", ["<Control>comma"])
         (self.props.active_window or Window(self)).present()
 
 
