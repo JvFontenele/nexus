@@ -34,6 +34,8 @@ SEEN_IDS = 1024  # ids lembrados por conexão para detectar replay
 INPUT_CONTROL = "input.control"
 INPUT_INJECT = "input.inject"  # este PC aceita ser controlado por aquele PC (padrão: desligada)
 AUDIO_IN = "audio.in"  # o dispositivo pode mandar o áudio dele sem perguntar (padrão: desligada, o PC pergunta)
+RELAY = "devices.relay"  # o dispositivo pode mandar texto, links e arquivos aos outros sem perguntar (padrão: desligada)
+RELAY_ASK = 25  # s de pergunta: o celular espera a resposta do pedido por 30 s
 AUDIO_ASK = 120  # s em que um pedido do PC (audio.in.start) vale como permissão, uma vez
 TRANSPORTS = ("adb", "bluetooth")
 INPUT_DEAD = 2.5  # s sem frame do controlador: solta tudo e encerra
@@ -133,7 +135,7 @@ class Daemon:
         self.audio_out_previous = None  # saída padrão de antes do "Nexus → …" (o áudio de volta não ecoa no aparelho)
         self.audio_in: dict[str, Conn] = {}  # device_id → conexão audio.push: vários ao mesmo tempo
         self.audio_in_asked: dict[str, float] = {}  # device_id → prazo monotônico do pedido do PC
-        self.audio_in_asking: set[str] = set()  # dispositivos com a pergunta "Permitir?" na tela
+        self.asking: set[tuple[str, str]] = set()  # (dispositivo, permissão) com a pergunta "Permitir?" na tela
         self.offers: dict[str, tuple[str, Path, float]] = {}  # id → (device_id, arquivo, prazo)
         self.transfers: dict[str, dict] = {}  # id → {"conn", "last"}: para progresso e cancelamento
         self.handshaking = 0
@@ -286,6 +288,10 @@ class Daemon:
             from nexus.actions.desktop import mirror
             out = await asyncio.to_thread(mirror, conn.record["name"], conn.ip)
             await conn.send(make("action.result", out, re=rid))
+        elif t == "devices.peers":
+            await conn.send(make("devices.peers.result", {"devices": self._peers_of(conn)}, re=rid))
+        elif t == "relay":
+            await conn.send(make("action.result", await self._relay(conn, body), re=rid))
         elif t == "share.text":
             await conn.send(make("action.result", await asyncio.to_thread(self._share_text, conn, body["text"]), re=rid))
         else:
@@ -419,7 +425,7 @@ class Daemon:
     def allow(self, device_id_: str, action: str) -> dict:
         if device_id_ not in self.store.records:
             return {"ok": False, "error": "dispositivo não pareado"}
-        if action not in ("*phone_safe", INPUT_CONTROL, INPUT_INJECT, AUDIO_IN):
+        if action not in ("*phone_safe", INPUT_CONTROL, INPUT_INJECT, AUDIO_IN, RELAY):
             a = catalog.REGISTRY.get(action)
             if a is None or not a.phone_safe:
                 return {"ok": False, "error": "ação inexistente ou não phone_safe"}
@@ -534,8 +540,8 @@ class Daemon:
         if (body["rate"], body["channels"], body["format"]) != (audio.RATE, audio.CHANNELS, "s16le"):
             raise ProtocolError("bad_format", "mande s16le, 48 kHz, estéreo")
         asked = self.audio_in_asked.pop(dev, 0) > time.monotonic()
-        if AUDIO_IN not in conn.record["permissions"] and not asked:
-            await self._ask_audio_in(conn)
+        if not asked:
+            await self._ask(conn, AUDIO_IN, "Áudio de {name}", "{name} quer tocar o áudio dele neste PC.")
         old = self.audio_in.get(dev)
         if old is not None:
             old.writer.transport.abort()  # um fluxo por dispositivo: o novo assume
@@ -571,23 +577,64 @@ class Daemon:
             log_event({"event": "audio.in.stop", "device_id": dev})
             self.emit({"event": "audio.in.changed", "device_id": dev, "on": False})
 
-    async def _ask_audio_in(self, conn: Conn):
-        """O dispositivo pediu sem permissão: pergunta numa notificação (Permitir, Sempre permitir, Negar)."""
+    async def _ask(self, conn: Conn, perm: str, title: str, body: str, timeout: int = 60):
+        """Sem a permissão `perm`, pergunta numa notificação (Permitir, Sempre permitir = liga a permissão, Negar).
+        Negado → ProtocolError forbidden. `title`/`body` usam {name}, o nome do dispositivo que pediu."""
         from nexus.actions import desktop
         dev = conn.device_id
-        if dev in self.audio_in_asking:
+        if perm in conn.record["permissions"]:
+            return
+        if (dev, perm) in self.asking:
             raise ProtocolError("forbidden", "o PC já está perguntando")
-        self.audio_in_asking.add(dev)
+        self.asking.add((dev, perm))
+        name = (conn.record.get("alias") or conn.record["name"])[:60]
         try:
-            answer = await asyncio.to_thread(desktop.ask_audio_in, conn.record["name"])
+            answer = await asyncio.to_thread(desktop.ask, title.format(name=name), body.format(name=name), timeout)
         finally:
-            self.audio_in_asking.discard(dev)
-        log_event({"event": "audio.in.asked", "device_id": dev, "answer": answer or "none"})
+            self.asking.discard((dev, perm))
+        log_event({"event": "permission.asked", "device_id": dev, "permission": perm, "answer": answer or "none"})
         if answer == "sempre":
-            self.store.allow(dev, AUDIO_IN)
+            self.store.allow(dev, perm)
             self.emit({"event": "device.changed", "device_id": dev})
         elif answer != "uma":
             raise ProtocolError("forbidden", "o PC não permitiu")
+
+    def _peers_of(self, conn: Conn) -> list:
+        return [{"device_id": r["device_id"], "name": r.get("alias") or r["name"], "kind": r["kind"],
+                 "connected": r["device_id"] in self.by_device}
+                for r in self.store.records.values() if r["device_id"] != conn.device_id]
+
+    def _relay_target(self, conn: Conn, to: str) -> Conn:
+        """A conexão do outro dispositivo (pareado, conectado, não o próprio); senão ProtocolError."""
+        rec = self.store.records.get(to)
+        if rec is None or to == conn.device_id:
+            raise ProtocolError("not_found", "aparelho não pareado com este PC")
+        target = self.by_device.get(to)
+        if target is None:
+            raise ProtocolError("offline", f"{rec.get('alias') or rec['name']} está desconectado")
+        return target
+
+    async def _relay(self, conn: Conn, body: dict) -> dict:
+        """Texto ou link de um dispositivo para outro, passando pelo PC (que não guarda o conteúdo)."""
+        kind, value = body["kind"], body["value"]
+        if kind == "url" and not value.lower().startswith(("https://", "http://")):
+            return {"ok": False, "error": "só links http(s)"}
+        if kind not in ("text", "url"):
+            return {"ok": False, "error": "tipo desconhecido"}
+        try:
+            target = self._relay_target(conn, body["to"])
+            await self._ask(conn, RELAY, "{name} quer mandar a outro aparelho",
+                            "{name} quer mandar " + ("um texto" if kind == "text" else "um link") + " para o "
+                            + (target.record.get("alias") or target.record["name"])[:60] + ".", RELAY_ASK)
+            src = conn.record.get("alias") or conn.record["name"]
+            await target.send(make("share.text", {"text": value, "from": src}) if kind == "text"
+                              else make("open.url", {"url": value, "from": src}))
+        except ProtocolError as e:
+            return {"ok": False, "error": e.message}
+        except (ConnectionError, OSError):
+            return {"ok": False, "error": "falha ao enviar"}
+        log_event({"event": "relay", "device_id": conn.device_id, "to": target.device_id, "kind": kind})
+        return {"ok": True}
 
     def _transfer_start(self, conn: Conn) -> dict:
         t = {"id": new_offer_id()[:16], "conn": conn, "last": 0.0}
@@ -614,6 +661,12 @@ class Daemon:
         size = body["size"]
         if not 0 <= size <= files.MAX_SIZE:
             raise ProtocolError("too_large", "arquivo grande demais")
+        to = body.get("to")
+        if to is not None:  # para outro dispositivo: pergunta antes de receber; fica também em ~/Downloads/Nexus
+            target = self._relay_target(conn, to)
+            await self._ask(conn, RELAY, "{name} quer mandar a outro aparelho", "{name} quer mandar o arquivo "
+                            + files.safe_name(body["name"])[:60] + " para o "
+                            + (target.record.get("alias") or target.record["name"])[:60] + ".", RELAY_ASK)
         directory = files.download_dir()
         directory.mkdir(parents=True, exist_ok=True)
         dest = files.unique_path(directory, files.safe_name(body["name"]))
@@ -640,6 +693,11 @@ class Daemon:
         name = conn.record["name"]
         log_event({"event": "file.received", "device_id": conn.device_id, "bytes": size})
         self.emit({"event": "file.received", "device_id": conn.device_id, "name": name, "path": str(dest)})
+        if to is not None:
+            out = await self._offer_file(to, str(dest), from_=name)
+            log_event({"event": "relay", "device_id": conn.device_id, "to": to, "kind": "file"})
+            await conn.send(make("action.result", {**out, "result": dest.name}, re=rid))
+            return
         await conn.send(make("action.result", {"ok": True, "result": dest.name}, re=rid))
         from nexus.actions.desktop import notify
         try:
@@ -647,7 +705,7 @@ class Daemon:
         except Exception:
             pass
 
-    async def _offer_file(self, device_id: str, path: str) -> dict:
+    async def _offer_file(self, device_id: str, path: str, from_: str | None = None) -> dict:
         """PC → dispositivo: oferece o arquivo; o dispositivo busca por uma conexão de dados (file.pull)."""
         conn = self.by_device.get(device_id)
         if conn is None:
@@ -661,7 +719,7 @@ class Daemon:
             return {"ok": False, "error": "arquivo grande demais"}
         offer = new_offer_id()
         self.offers[offer] = (device_id, p, self.clock() + 300)
-        await conn.send(make("file.offer", {"id": offer, "name": p.name, "size": size}))
+        await conn.send(make("file.offer", {"id": offer, "name": p.name, "size": size, **({"from": from_} if from_ else {})}))
         return {"ok": True}
 
     async def _file_pull(self, conn: Conn, body: dict, rid: str):

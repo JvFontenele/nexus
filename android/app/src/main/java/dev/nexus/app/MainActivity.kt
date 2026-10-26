@@ -115,6 +115,8 @@ class MainActivity : ComponentActivity() {
     private var pending by mutableStateOf<Pair<String, String>?>(null) // código, fp do PC
     private var decision: CompletableFuture<Boolean>? = null
     private var actions by mutableStateOf<List<RemoteAction>>(emptyList())
+    private var peers by mutableStateOf<List<Peer>>(emptyList())
+    private var alvo: Peer? = null // aparelho escolhido para o seletor de arquivos
     private var controlado by mutableStateOf(false)
     private var autoclique by mutableStateOf(false)
     private var bateriaLivre by mutableStateOf(true)
@@ -195,6 +197,22 @@ class MainActivity : ComponentActivity() {
         runOnUiThread { if (list != null) actions = list }
     }
 
+    private fun loadPeers() = thread {
+        val list = runCatching { withPc(this) { it.listPeers() } }.getOrNull()
+        runOnUiThread { if (list != null) peers = list }
+    }
+
+    /** Área de transferência para outro aparelho (com a tela em primeiro plano o Android deixa ler). */
+    private fun relayClipboard(p: Peer) {
+        val text = getSystemService(ClipboardManager::class.java).primaryClip
+            ?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(this)?.toString()
+        if (text.isNullOrEmpty()) {
+            status = "A área de transferência está vazia"
+            return
+        }
+        work("Enviando ao ${p.name}… (o PC pode perguntar antes)") { withPc(this) { it.relay(p.id, text) }; "Enviado ao ${p.name}" }
+    }
+
     private fun runAction(a: RemoteAction) = work("Executando ${a.description}…") {
         "${a.description}: " + withPc(this) { it.runAction(a.id, emptyMap()) }
     }
@@ -215,11 +233,12 @@ class MainActivity : ComponentActivity() {
         work("Enviando…") { if (withPc(this) { it.shareText(text.take(65536)) } == "copiado") "Copiado no PC" else "Enviado ao PC" }
     }
 
-    private fun sendFiles(uris: List<Uri>) {
+    private fun sendFiles(uris: List<Uri>, to: Peer? = null) {
         if (uris.isEmpty()) return
         work("Enviando ${uris.size} arquivo(s)…") {
-            val ok = uris.count { runCatching { FileTransfer.push(this, it) }.isSuccess }
-            "$ok de ${uris.size} arquivo(s) no PC"
+            var erro: Throwable? = null
+            val ok = uris.count { runCatching { FileTransfer.push(this, it, to) }.onFailure { e -> erro = e }.isSuccess }
+            "$ok de ${uris.size} arquivo(s) no ${to?.name ?: "PC"}" + (erro?.let { " · ${it.message}" } ?: "")
         }
     }
 
@@ -322,6 +341,7 @@ class MainActivity : ComponentActivity() {
             }
         }
         LaunchedEffect(linkUp) { if (linkUp) loadActions() }
+        LaunchedEffect(linkUp) { while (linkUp) { loadPeers(); delay(15_000) } } // quem está conectado muda
         DisposableEffect(Unit) { // teclado/mouse do PC: UHID aparece e some com a borda
             val im = getSystemService(InputManager::class.java)
             val l = object : InputManager.InputDeviceListener {
@@ -408,6 +428,9 @@ class MainActivity : ComponentActivity() {
     private fun Principal() {
         val pick = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { sendFiles(it) }
         val escolher = { pick.launch(arrayOf("*/*")) }
+        val pickPara = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+            alvo?.let { sendFiles(uris, it) }
+        }
         val rolagem = rememberScrollState()
         LaunchedEffect(aba) { rolagem.scrollTo(0) }
         Column(Modifier.fillMaxSize()) {
@@ -415,7 +438,7 @@ class MainActivity : ComponentActivity() {
                 .verticalScroll(rolagem), verticalArrangement = Arrangement.spacedBy(14.dp)) {
                 Text(if (aba == 0) "Nexus" else ABAS[aba].first, fontSize = 26.sp, fontWeight = FontWeight.Bold)
                 when (aba) {
-                    0 -> AbaInicio(escolher)
+                    0 -> AbaInicio(escolher) { p -> alvo = p; pickPara.launch(arrayOf("*/*")) }
                     1 -> AbaAudio()
                     2 -> AbaArquivos(escolher)
                     else -> AbaAjustes()
@@ -433,7 +456,7 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun AbaInicio(escolher: () -> Unit) {
+    private fun AbaInicio(escolher: () -> Unit, arquivoPara: (Peer) -> Unit) {
         val expr = when {
             !linked -> "dormindo"
             !linkUp -> "preocupado"
@@ -476,6 +499,30 @@ class MainActivity : ComponentActivity() {
                 ::sendClipboard)
         }
         if (actions.isNotEmpty()) Cartao { ControlarPc() }
+        if (linkUp && peers.isNotEmpty()) Cartao { OutrosAparelhos(arquivoPara) }
+    }
+
+    /** Mandar a outro celular ou tablet pareado com o mesmo PC; o PC repassa (e pode perguntar antes). */
+    @Composable
+    private fun OutrosAparelhos(arquivoPara: (Peer) -> Unit) {
+        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text("Outros aparelhos", fontWeight = FontWeight.Bold, fontSize = 15.sp)
+            peers.forEach { p ->
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Box(Modifier.size(8.dp).background(if (p.connected) Cores.verde else Color(0xFF6B6F7A), CircleShape))
+                        Text(p.name, fontWeight = FontWeight.Bold)
+                        Text(if (p.connected) "conectado" else "desconectado", color = Cores.apagado, fontSize = 13.sp)
+                    }
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton({ relayClipboard(p) }, enabled = p.connected && !busy, modifier = Modifier.heightIn(min = 44.dp),
+                            border = BorderStroke(1.5.dp, Cores.borda)) { Text("Área de transferência", fontSize = 14.sp) }
+                        OutlinedButton({ arquivoPara(p) }, enabled = p.connected && !busy, modifier = Modifier.heightIn(min = 44.dp),
+                            border = BorderStroke(1.5.dp, Cores.borda)) { Text("Arquivo", fontSize = 14.sp) }
+                    }
+                }
+            }
+        }
     }
 
     @Composable

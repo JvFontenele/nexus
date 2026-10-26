@@ -170,7 +170,8 @@ class LinkService : Service(), Pc {
                 val text = body.optString("text")
                 // escrever no clipboard em segundo plano é permitido; só a leitura é restrita no Android 10+
                 getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("Nexus", text))
-                notify(text.hashCode(), push("Texto do PC copiado", text, null))
+                val de = body.optString("from").ifEmpty { null } // outro aparelho, pelo PC
+                notify(text.hashCode(), push(if (de != null) "Texto de $de copiado" else "Texto do PC copiado", text, null))
             }
             "file.offer" -> thread(name = "nexus-file") {
                 runCatching { FileTransfer.pull(this, body) }.onFailure {
@@ -190,7 +191,8 @@ class LinkService : Service(), Pc {
                 // Android bloqueia abrir Activity do segundo plano: o usuário toca na notificação para abrir
                 val open = PendingIntent.getActivity(this, uri.hashCode(), Intent(Intent.ACTION_VIEW, uri),
                     PendingIntent.FLAG_IMMUTABLE)
-                notify(uri.hashCode(), push("Abrir link do PC", uri.toString(), open))
+                val de = body.optString("from").ifEmpty { null }
+                notify(uri.hashCode(), push(if (de != null) "Abrir link de $de" else "Abrir link do PC", uri.toString(), open))
             }
         }
     }

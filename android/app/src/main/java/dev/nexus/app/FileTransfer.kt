@@ -79,8 +79,8 @@ object FileTransfer {
         return Session(host, PORT, Identity.load(), pin = pin, presentCert = true).also { it.timeoutMs = 60_000 }
     }
 
-    /** Celular → PC. Devolve o nome com que o PC salvou. */
-    fun push(ctx: Context, uri: Uri): String {
+    /** Celular → PC (ou, com `to`, para outro aparelho, passando pelo PC). Devolve o nome com que o PC salvou. */
+    fun push(ctx: Context, uri: Uri, to: Peer? = null): String {
         var name = "arquivo"
         var size = -1L
         ctx.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)?.use { c ->
@@ -90,10 +90,10 @@ object FileTransfer {
             }
         }
         if (size < 0) throw ProtocolException("tamanho desconhecido")
-        val progresso = Progresso(ctx, "Enviando ao PC", name, size, android.R.drawable.stat_sys_upload)
+        val progresso = Progresso(ctx, "Enviando ao ${to?.name ?: "PC"}", name, size, android.R.drawable.stat_sys_upload)
         try {
             dataSession(ctx).use { s ->
-                s.send("file.push", JSONObject().put("name", name).put("size", size))
+                s.send("file.push", JSONObject().put("name", name).put("size", size).apply { to?.let { put("to", it.id) } })
                 s.expect("file.ready")
                 val buf = ByteArray(CHUNK)
                 var sent = 0L
@@ -106,7 +106,9 @@ object FileTransfer {
                         progresso.atualizar(sent)
                     }
                 }
-                return s.expect("action.result").optString("result").also { progresso.fim(ok = true) }
+                val r = s.expect("action.result")
+                if (!r.optBoolean("ok", true)) throw ProtocolException(r.optString("error", "falhou"))
+                return r.optString("result").also { progresso.fim(ok = true) }
             }
         } finally {
             progresso.fim()
@@ -115,11 +117,12 @@ object FileTransfer {
 
     /** PC → celular: busca a oferta e salva em Download/Nexus (MediaStore, sem permissão de armazenamento). */
     fun pull(ctx: Context, offer: JSONObject) {
+        val de = offer.optString("from").ifEmpty { null } // outro aparelho, pelo PC; sem `from`, veio do PC
         dataSession(ctx).use { s ->
             s.send("file.pull", JSONObject().put("id", offer.getString("id")))
             val ready = s.expect("file.ready")
             val size = ready.getLong("size")
-            val progresso = Progresso(ctx, "Recebendo do PC", ready.getString("name"), size,
+            val progresso = Progresso(ctx, if (de != null) "Recebendo de $de" else "Recebendo do PC", ready.getString("name"), size,
                 android.R.drawable.stat_sys_download)
             val values = ContentValues().apply {
                 put(MediaStore.Downloads.DISPLAY_NAME, ready.getString("name"))
@@ -149,7 +152,7 @@ object FileTransfer {
                 Intent(Intent.ACTION_VIEW, uri).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION), PendingIntent.FLAG_IMMUTABLE)
             ctx.getSystemService(NotificationManager::class.java).notify(uri.hashCode(),
                 android.app.Notification.Builder(ctx, "push").setSmallIcon(android.R.drawable.stat_sys_download_done)
-                    .setContentTitle("Arquivo do PC").setContentText(ready.getString("name"))
+                    .setContentTitle(if (de != null) "Arquivo de $de" else "Arquivo do PC").setContentText(ready.getString("name"))
                     .setContentIntent(open).setAutoCancel(true).build())
         }
     }

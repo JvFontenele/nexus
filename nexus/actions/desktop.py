@@ -49,14 +49,13 @@ register(Action("pc.notify", "Mostrar uma notificação no PC", lambda p: notify
 register(Action("media.play-pause", "Tocar/pausar o player do PC", _play_pause, phone_safe=True))
 
 
-def ask_audio_in(name: str, timeout: int = 60) -> str | None:
-    """Notificação "quer tocar o áudio dele neste PC": "uma", "sempre" ou None (negou, fechou ou o tempo acabou).
+def ask(title: str, body: str, timeout: int = 60) -> str | None:
+    """Notificação com Permitir, Sempre permitir e Negar: "uma", "sempre" ou None (negou, fechou ou o tempo acabou).
     Bloqueia; rode numa thread."""
     try:
         out = subprocess.run(["notify-send", "--app-name=Nexus", "--urgency=critical", "--wait",
                               "--action=uma=Permitir", "--action=sempre=Sempre permitir", "--action=nao=Negar", "--",
-                              "Áudio de " + name[:60], f"{name[:60]} quer tocar o áudio dele neste PC."],
-                             capture_output=True, text=True, timeout=timeout).stdout.strip()
+                              title, body], capture_output=True, text=True, timeout=timeout).stdout.strip()
     except (subprocess.SubprocessError, OSError):
         return None
     return out if out in ("uma", "sempre") else None

@@ -591,12 +591,12 @@ class TestDaemon(unittest.TestCase):
         fmt = {"rate": 48000, "channels": 2, "format": "s16le"}
         answers = [None, "sempre"]
         with mock.patch("nexus.audio.playback_argv", return_value=sink) as argv, \
-                mock.patch("nexus.actions.desktop.ask_audio_in", side_effect=lambda name: answers.pop(0)) as ask:
+                mock.patch("nexus.actions.desktop.ask", side_effect=lambda *a: answers.pop(0)) as ask:
             a = self.client(self.phone)
             self.assertNotIn("audio.in", self.d.store.records[self.fp_phone]["permissions"])  # nasce desligada
             a.send("audio.push", fmt)
             self.assertEqual(a.recv()["body"]["code"], "forbidden")  # o PC perguntou e o usuário negou
-            ask.assert_called_once_with("teste")
+            ask.assert_called_once_with("Áudio de teste", "teste quer tocar o áudio dele neste PC.", 60)
             # o PC pede: vale uma vez, sem a permissão
             self.assertTrue(self.call(self.d._control_cmd({"cmd": "audio.in.start", "device_id": self.fp_phone}))["ok"])
             self.assertEqual(c.recv()["type"], "audio.in.start")
@@ -633,6 +633,45 @@ class TestDaemon(unittest.TestCase):
             self.assertIn("audio.in", self.d.store.records[self.fp_phone]["permissions"])
             b.s.close()
         self.assertIn({"event": "audio.in.changed", "device_id": self.fp_phone, "on": False}, events)
+
+    def test_relay_between_devices(self):
+        import struct as st
+        from unittest import mock
+        from nexus.proto.identity import device_id
+        c = self.pair()
+        t = self.pair(self.tablet)
+        fp_tablet = device_id(self.tablet[0])
+        c.send("devices.peers", {})
+        peers = c.recv()["body"]["devices"]
+        self.assertEqual([(p["device_id"], p["connected"]) for p in peers], [(fp_tablet, True)])  # sem o próprio
+        answers = [None, "sempre"]
+        down = Path(tempfile.mkdtemp(dir=self.tmp.name))
+        with mock.patch("nexus.actions.desktop.ask", side_effect=lambda *a: answers.pop(0)) as ask, \
+                mock.patch("nexus.files.download_dir", return_value=down):
+            relay = lambda **b: (c.send("relay", b), c.recv()["body"])[1]
+            self.assertFalse(relay(to=fp_tablet, kind="text", value="oi")["ok"])  # perguntou e o usuário negou
+            self.assertEqual(relay(to=fp_tablet, kind="text", value="oi"), {"ok": True})  # "Sempre permitir"
+            self.assertIn("devices.relay", self.d.store.records[self.fp_phone]["permissions"])
+            self.assertEqual(t.recv()["body"], {"text": "oi", "from": "teste"})
+            self.assertFalse(relay(to=fp_tablet, kind="url", value="javascript:alert(1)")["ok"])
+            self.assertTrue(relay(to=fp_tablet, kind="url", value="https://exemplo.org")["ok"])
+            self.assertEqual(t.recv()["body"], {"url": "https://exemplo.org", "from": "teste"})
+            self.assertFalse(relay(to=self.fp_phone, kind="text", value="eu")["ok"])  # para si mesmo, não
+            self.assertEqual(ask.call_count, 2)  # com a permissão, não pergunta mais
+            a = self.client(self.phone)
+            a.send("file.push", {"name": "nota.txt", "size": 3, "to": fp_tablet})
+            self.assertEqual(a.recv()["type"], "file.ready")
+            a.raw(st.pack(">I", 3) + b"abc")
+            self.assertTrue(a.recv()["body"]["ok"])
+            offer = t.recv()
+            self.assertEqual((offer["type"], offer["body"]["name"], offer["body"]["from"]), ("file.offer", "nota.txt", "teste"))
+        t.send("unpair", {})
+        for _ in range(100):
+            if fp_tablet not in self.d.by_device:
+                break
+            time.sleep(0.02)
+        c.send("relay", {"to": fp_tablet, "kind": "text", "value": "oi"})
+        self.assertFalse(c.recv()["body"]["ok"])  # revogado: não pareado
 
     def test_file_push_and_pull(self):
         import struct as st

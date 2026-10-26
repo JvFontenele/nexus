@@ -222,6 +222,22 @@ fun Pc.runAction(action: String, params: Map<String, String>): String {
     }
 }
 
+/** Outro celular ou tablet pareado com o mesmo PC. */
+data class Peer(val id: String, val name: String, val connected: Boolean)
+
+fun Pc.listPeers(): List<Peer> {
+    val arr = request("devices.peers", JSONObject(), "devices.peers.result").getJSONArray("devices")
+    return List(arr.length()) { i -> arr.getJSONObject(i).let { Peer(it.getString("device_id"), it.getString("name"), it.optBoolean("connected")) } }
+}
+
+/** Texto (ou um link sozinho) para outro aparelho, pelo PC; o PC pode perguntar antes. Erro → ProtocolException. */
+fun Pc.relay(to: String, text: String) {
+    val link = text.trim().takeIf { Regex("https?://\\S+", RegexOption.IGNORE_CASE).matches(it) }
+    val r = request("relay", JSONObject().put("to", to).put("kind", if (link != null) "url" else "text")
+        .put("value", link ?: text.take(65536)), "action.result")
+    if (!r.optBoolean("ok")) throw ProtocolException(r.optString("error", "falhou"))
+}
+
 fun Pc.shareText(text: String): String {
     return request("share.text", JSONObject().put("text", text), "action.result").optString("result")
 }

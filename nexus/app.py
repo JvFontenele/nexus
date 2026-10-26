@@ -190,7 +190,7 @@ def activity(device_id: str, limit: int = 6) -> list[tuple[str, str]]:
     from nexus.log import state_dir
     labels = {"file.received": "Arquivo recebido", "file.sent": "Arquivo enviado", "share.text": "Texto do dispositivo",
               "send.text": "Texto enviado", "open.url": "Link aberto no dispositivo", "audio.start": "Áudio do PC no dispositivo",
-              "audio.in.start": "Áudio do dispositivo no PC",
+              "audio.in.start": "Áudio do dispositivo no PC", "relay": "Mandou a outro aparelho",
               "pair.ok": "Pareado"}
     try:
         lines = (state_dir() / "events.jsonl").read_text().splitlines()[-400:]
@@ -561,16 +561,17 @@ class Window(Adw.ApplicationWindow):
         # sentido inverso: o PC controla o dispositivo (scrcpy/adb); fica aqui para estar junto das outras chaves
         row = Gtk.Box(css_classes=["nx-row"])
         # um PC pareado aqui é quem controla: a chave é deixar ele controlar este PC (input.inject)
-        if d["kind"] != "pc":
-            label = "Mandar o áudio dele para tocar neste PC"
-            row.append(Gtk.Label(label=label, xalign=0, hexpand=True))
-            sw = Gtk.Switch(active="audio.in" in d["permissions"], valign=Gtk.Align.CENTER,
-                            tooltip_text="Desligado, o PC pergunta a cada vez")
-            sw.update_property([Gtk.AccessibleProperty.LABEL], [label])
-            sw.connect("notify::active", self.toggle_permission, d["device_id"], "audio.in")
-            row.append(sw)
-            card.append(row)
-            row = Gtk.Box(css_classes=["nx-row"])
+        if d["kind"] != "pc":  # desligadas, o PC pergunta a cada vez (Permitir, Sempre permitir, Negar)
+            for perm, label in (("audio.in", "Mandar o áudio dele para tocar neste PC"),
+                                ("devices.relay", "Mandar texto, links e arquivos aos outros aparelhos")):
+                row.append(Gtk.Label(label=label, xalign=0, hexpand=True))
+                sw = Gtk.Switch(active=perm in d["permissions"], valign=Gtk.Align.CENTER,
+                                tooltip_text="Desligado, o PC pergunta a cada vez")
+                sw.update_property([Gtk.AccessibleProperty.LABEL], [label])
+                sw.connect("notify::active", self.toggle_permission, d["device_id"], perm)
+                row.append(sw)
+                card.append(row)
+                row = Gtk.Box(css_classes=["nx-row"])
         perm = "input.inject" if d["kind"] == "pc" else "input.control"
         label = ("Controlar este PC com o teclado e o mouse dele" if perm == "input.inject"
                  else "Ser controlado pelo teclado e mouse deste PC")
