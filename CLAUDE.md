@@ -2,13 +2,14 @@
 
 Integração PC Linux (Zorin OS 18 / GNOME 46 Wayland) ↔ Android, própria e cifrada. Visão geral para humanos: `README.md`.
 Histórico de tarefas e status: `.ia/plan.md`. Decisões: `docs/architecture/decisions/0001…0005`. Protocolo: `docs/protocol/v1.md`.
+Repositórios de referência (Beamer, Coucou, Zorin Connect) e o commit estudado de cada um: `docs/research/referencias.md`.
 
 ## Como trabalhar aqui
 - **Idioma:** responda, comente e escreva a UI em **português do Brasil**.
 - **Commits:** **nunca** faça commit ou push sem o usuário pedir. Remotos: `git@github.com:JvFontenele/nexus.git` (branch `main`) e `git@github.com:JvFontenele/balao.git`. Use SSH; não há `gh` instalado.
 - **ChatGPT como orquestrador/revisor:** a conversa fica no Chrome, em https://chatgpt.com/c/6adcc434-05dc-83e8-9f0d-8d66687d6e59.
   - **Quando:** em cada marco ou decisão de arquitetura, mande uma consulta com o cabeçalho `Projeto | Fase | Consulta #ID | Objetivo | Contexto técnico | Tentativas/resultados | Restrições | Decisão necessária | Resultado esperado`, terminando com "Responda curto.".
-  - **Numeração:** a última foi a **#012**; a próxima é a **#013**.
+  - **Numeração:** a última foi a **#013**; a próxima é a **#014**.
   - **Ler a resposta:** pegue o texto depois de "Responda curto." em `main.innerText`, em pedaços de até 2000 caracteres.
   - **Plano gratuito:** a conversa está longa, e o próprio ChatGPT avisa que perde detalhes.
 - **ia-local:** o modelo local Qwen (comando `ia`) inventou schemas inseguros na T02a. Código de segurança, protocolo e pareamento é escrito e revisado pelo Claude.

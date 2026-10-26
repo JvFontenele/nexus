@@ -31,3 +31,7 @@ Abra a porta 47210/tcp no firewall **só para a sua rede local e para a tailnet*
 3. Libere no PC as ações que o celular pode executar (app Nexus → permissões).
 
 CLI: `nexus devices list|allow|deny|revoke`, `nexus pair pending|confirm`, `nexus mirror`, `nexus app`.
+
+## Licença
+
+GPL-3.0 (`LICENSE`).
