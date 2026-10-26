@@ -10,7 +10,7 @@ Repositórios de referência (Beamer, Coucou, Zorin Connect) e o commit estudado
 - **ChatGPT como orquestrador/revisor:** a conversa fica no Chrome, em https://chatgpt.com/c/6adcc434-05dc-83e8-9f0d-8d66687d6e59.
   - **Quando:** em cada marco ou decisão de arquitetura, mande uma consulta com o cabeçalho `Projeto | Fase | Consulta #ID | Objetivo | Contexto técnico | Tentativas/resultados | Restrições | Decisão necessária | Resultado esperado`, terminando com "Responda curto.".
   - **Numeração:** a última foi a **#013**; a próxima é a **#014**.
-  - **Pendente (#014):** não foi enviada porque a extensão do Chrome não estava conectada à conta pessoal. Assunto: áudio do aparelho → PC (AudioPlaybackCapture + `audio.push`, vários aparelhos mixados no PipeWire) e reorganização dos apps (abas no PC, barra inferior no Android, Preferências).
+  - **Pendente (#014):** não foi enviada porque a extensão do Chrome não estava conectada à conta pessoal. Assunto: áudio do aparelho → PC (AudioPlaybackCapture + `audio.push`, vários aparelhos mixados no PipeWire) , reorganização dos apps (abas no PC, barra inferior no Android, Preferências) e repasse entre aparelhos pelo PC (`relay`, `file.push`/`audio.push` com `to`, permissão `devices.relay` que pergunta).
   - **Ler a resposta:** pegue o texto depois de "Responda curto." em `main.innerText`, em pedaços de até 2000 caracteres.
   - **Plano gratuito:** a conversa está longa, e o próprio ChatGPT avisa que perde detalhes.
 - **ia-local:** o modelo local Qwen (comando `ia`) inventou schemas inseguros na T02a. Código de segurança, protocolo e pareamento é escrito e revisado pelo Claude.
@@ -61,11 +61,12 @@ systemctl --user restart nexusd                             # depois de mudar c�
 - **Tailscale do PC:** `100.77.106.53`. No celular, o Tailscale não respondia no último teste.
 
 ## Pendências e próximas etapas (em ordem)
-0. **Aprovar o Claude Code pelo notch (Fase B, pronta, sem instalar):** `nexus agents install [--config-dir DIR]` mostra o diff do hook `PermissionRequest` no `settings.json` e só grava com `--yes` (backup `settings.json.bak-AAAAMMDD-HHMMSS`). Instalar em `~/.claude` e `~/.claude-pessoal` só com o usuário. Depois: validar com uma sessão real; **Fase C** = aprovar pelo celular (mensagem nova no protocolo, permissão por dispositivo desligada por padrão); AskUserQuestion fora por ora.
-1. **Tablet:** parear na mesma rede e validar multidispositivo (áudio, arquivo e espelhamento para o dispositivo certo; o seletor de alvo no notch).
+0. **Claude Code pelo notch:** o hook `PermissionRequest` está instalado em `~/.claude` e `~/.claude-pessoal` (Preferências do app mostram) e já aprovou pedidos reais. Falta a **Fase C** = aprovar pelo celular (mensagem nova no protocolo, permissão por dispositivo desligada por padrão); AskUserQuestion fora por ora.
+1. **Tablet:** pareado; áudio (nos dois sentidos e entre aparelhos), arquivos, texto e a borda já validados com o POCO junto. Falta conferir o espelhamento no aparelho certo e o seletor de destino no notch.
 2. **Android no boot:** `BOOT_COMPLETED` + guia de "Sem restrições" de bateria/autostart no HyperOS/One UI. Validar após bloqueio, remoção dos recentes e reinício.
 3. **Testes longos (#011/#012):** áudio por 30–60 min, queda de Wi-Fi no meio, bloquear/desbloquear o celular, latência pela tailnet (Opus só se precisar).
 4. **Cancelar transferência pelo celular:** hoje só o PC cancela, e o celular para junto.
 5. **Arrastar arquivos até o notch:** prova de conceito de DnD no Shell/Wayland. Se não der, o app GTK recebe o arrasto.
 6. **IP dinâmico:** o daemon reanunciar e reescutar quando a rede muda, sem precisar reiniciar. Excluir interfaces de ancoragem USB (`enx…`) do `default_listen`.
 7. **Revisão de escopo da v0.1** contra o prompt original: IA, ações dinâmicas/configuráveis, VPN completa pela tailnet, distribuição para outras distros (empacotamento, desinstalação).
+8. **Print do Android no README:** `docs/img/android.png` é de antes do cartão "Outros aparelhos" (aba Início). Refazer com dados fictícios: trocar `pc_name` no `shared_prefs/nexus.xml` por `run-as dev.nexus.app` só durante o print (depois voltar), cortar a barra de status e, se possível, apelidos fictícios no PC (`devices.rename`) — o print do PC sai do daemon falso (ver o histórico).
