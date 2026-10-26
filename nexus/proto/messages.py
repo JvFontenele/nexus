@@ -37,7 +37,7 @@ SCHEMAS = {
     "audio.start":    {},
     "audio.stop":     {},
     "audio.ready":    {"rate": int, "channels": int, "format": str},
-    "audio.push":     {"rate": int, "channels": int, "format": str},
+    "audio.push":     {"rate": int, "channels": int, "format": str, "to?": str},
     "audio.in.start": {},
     "audio.in.stop":  {},
     "devices.peers":  {},

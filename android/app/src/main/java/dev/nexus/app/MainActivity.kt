@@ -100,12 +100,15 @@ class MainActivity : ComponentActivity() {
     private var audioText by mutableStateOf<String?>(null)
     private var audioOutOn by mutableStateOf(false)
     private var audioOutText by mutableStateOf<String?>(null)
+    private var audioOutTo by mutableStateOf<Peer?>(null)
+    private var destinoAudio: Peer? = null // escolhido antes da permissão e da confirmação (assíncronas)
     private val pedirCaptura = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
         val data = r.data
-        status = if (r.resultCode != RESULT_OK || data == null) "Áudio para o PC: cancelado"
-        else when (runCatching { LinkService.startAudioOut(r.resultCode, data) }.getOrElse { status = "Erro: ${it.message}"; return@registerForActivityResult }) {
+        val to = destinoAudio
+        status = if (r.resultCode != RESULT_OK || data == null) "Áudio para o ${to?.name ?: "PC"}: cancelado"
+        else when (runCatching { LinkService.startAudioOut(r.resultCode, data, to) }.getOrElse { status = "Erro: ${it.message}"; return@registerForActivityResult }) {
             null -> "Ligue \"Manter conectado\" primeiro"
-            else -> "Conectando o áudio ao PC…"
+            else -> "Conectando o áudio ao ${to?.name ?: "PC"}…"
         }
     }
     private val pedirMicrofone = registerForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
@@ -250,9 +253,11 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun toggleAudioOut() {
+    /** `to` = outro aparelho (pelo PC); null = o próprio PC. Mandando, qualquer toque para o envio atual. */
+    private fun toggleAudioOut(to: Peer? = null) {
+        destinoAudio = to
         when {
-            LinkService.audioSending() -> { LinkService.stopAudioOut(); status = "Áudio para o PC parado" }
+            LinkService.audioSending() -> { LinkService.stopAudioOut(); status = "Áudio daqui parado" }
             LinkService.connected() == null -> status = "Ligue \"Manter conectado\" primeiro"
             checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED -> pedirConfirmacao()
             else -> pedirMicrofone.launch(android.Manifest.permission.RECORD_AUDIO)
@@ -335,6 +340,7 @@ class MainActivity : ComponentActivity() {
                 audioText = LinkService.lastAudioText
                 audioOutOn = LinkService.audioSending()
                 audioOutText = LinkService.lastAudioOutText
+                audioOutTo = LinkService.audioTarget()
                 autoclique = LinkService.cliqueAutomatico(this@MainActivity)
                 bateriaLivre = getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
                 delay(1000)
@@ -519,6 +525,12 @@ class MainActivity : ComponentActivity() {
                             border = BorderStroke(1.5.dp, Cores.borda)) { Text("Área de transferência", fontSize = 14.sp) }
                         OutlinedButton({ arquivoPara(p) }, enabled = p.connected && !busy, modifier = Modifier.heightIn(min = 44.dp),
                             border = BorderStroke(1.5.dp, Cores.borda)) { Text("Arquivo", fontSize = 14.sp) }
+                        // um envio de áudio por vez: enquanto manda, só o destino atual pode parar
+                        val tocando = audioOutOn && audioOutTo?.id == p.id
+                        OutlinedButton({ toggleAudioOut(p) }, enabled = p.connected && !busy && (!audioOutOn || tocando),
+                            modifier = Modifier.heightIn(min = 44.dp), border = BorderStroke(1.5.dp, Cores.borda)) {
+                            Text(if (tocando) "Parar áudio" else "Áudio", fontSize = 14.sp)
+                        }
                     }
                 }
             }
@@ -530,7 +542,7 @@ class MainActivity : ComponentActivity() {
         CartaoAudio("Áudio do PC aqui", "O som do PC toca neste aparelho.",
             if (audioOn) audioText?.removePrefix("Áudio do PC · ") else null, audioOn, linkUp, ::toggleAudio)
         CartaoAudio("Áudio daqui no PC", "O som dos apps deste aparelho toca no PC. O Android pede confirmação a cada vez.",
-            if (audioOutOn) "Tocando no PC" else audioOutText, audioOutOn, linkUp || audioOutOn, ::toggleAudioOut)
+            if (audioOutOn) "Tocando no ${audioOutTo?.name ?: "PC"}" else audioOutText, audioOutOn, linkUp || audioOutOn) { toggleAudioOut() }
         Text(if (linkUp) "Baixe o volume deste aparelho: o PC continua tocando."
             else "Ligue \"Manter conectado\" no Início para usar o áudio.", color = Cores.apagado, fontSize = 13.sp)
     }

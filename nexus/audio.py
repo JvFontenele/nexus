@@ -4,6 +4,9 @@ import subprocess
 import time
 
 SINK = "nexus-audio"
+# saída de quem só ouve outro dispositivo: outro nome porque o WirePlumber lembra as saídas que já foram a padrão
+# (o "nexus-audio" foi) e devolveria a padrão a ela assim que aparecesse, levando o som do PC junto
+PONTE = "nexus-ponte"
 RATE, CHANNELS = 48000, 2
 FRAME = RATE // 100 * CHANNELS * 2  # 10 ms de s16 estéreo = 1920 bytes
 
@@ -21,6 +24,17 @@ def node_id(name: str) -> int | None:
     return None
 
 
+def node_name(nid: int | None) -> str | None:
+    """node.name do nó `nid`: o --target do pw-cat só segue nomes (com o id, cai na saída padrão)."""
+    if nid is None:
+        return None
+    try:
+        objs, _ = json.JSONDecoder().raw_decode(_run(["pw-dump"]))
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return None
+    return next((o["info"]["props"].get("node.name") for o in objs if o.get("id") == nid), None)
+
+
 def default_sink() -> int | None:
     """id da saída padrão atual ("id 54, type …" na primeira linha do wpctl inspect)."""
     try:
@@ -32,27 +46,31 @@ def default_sink() -> int | None:
 
 def cleanup():
     """Remove a saída de um nexusd anterior que caiu (o nó tem object.linger e sobreviveria)."""
-    try:
-        nid = node_id(SINK)
-        if nid is not None:
-            _run(["pw-cli", "destroy", str(nid)])
-    except (subprocess.SubprocessError, OSError):
-        pass
+    for name in (SINK, PONTE):
+        try:
+            nid = node_id(name)
+            if nid is not None:
+                _run(["pw-cli", "destroy", str(nid)])
+        except (subprocess.SubprocessError, OSError):
+            pass
 
 
-def start(device_name: str) -> tuple[int, int | None]:
-    """Cria a saída "Nexus → <dispositivo>" e a torna padrão. Devolve (id da saída, id da saída padrão anterior)."""
+def start(device_name: str, make_default: bool = True) -> tuple[int, int | None]:
+    """Cria a saída "Nexus → <dispositivo>" e a torna padrão (ou não: só para o áudio de outro dispositivo).
+    Devolve (id da saída, id da saída padrão anterior)."""
     cleanup()
-    previous = default_sink()
+    previous = default_sink() if make_default else None
     desc = "Nexus → " + _safe(device_name)
+    name = sink_name(make_default)
     _run(["pw-cli", "create-node", "adapter",
           "{ factory.name=support.null-audio-sink node.name=%s node.description=\"%s\" media.class=Audio/Sink "
-          "object.linger=true audio.position=[FL FR] }" % (SINK, desc)])
+          "object.linger=true audio.position=[FL FR] priority.session=1 }" % (name, desc)])
     try:
-        nid = node_id(SINK)
+        nid = node_id(name)
         if nid is None:
             raise RuntimeError("PipeWire não criou a saída")
-        _run(["wpctl", "set-default", str(nid)])
+        if make_default:
+            _run(["wpctl", "set-default", str(nid)])
     except Exception:
         stop_by_name(previous)  # nunca deixar o PC com uma saída padrão que ninguém escuta
         raise
@@ -81,14 +99,14 @@ def _safe(name: str) -> str:
     return "".join(c for c in name if c.isalnum() or c in " -_.")[:40]  # vai dentro das propriedades do PipeWire
 
 
-def playback_argv(device_name: str, key: str, target: int | None = None) -> list[str]:
+def playback_argv(device_name: str, key: str, target: str | None = None) -> list[str]:
     """Toca o áudio de um dispositivo (stdin) num fluxo próprio "Nexus ← …": o PipeWire mistura vários, e o volume
     de cada um fica nas Configurações de som do GNOME."""
     desc = "Nexus ← " + _safe(device_name)
     props = '{ node.name=nexus-in-%s media.name="%s" node.description="%s" }' % (_safe(key), desc, desc)
     argv = ["pw-cat", "--playback", "-P", props, "--format", "s16", "--rate", str(RATE), "--channels", str(CHANNELS),
             "--latency", "40ms"]
-    return argv + (["--target", str(target)] if target is not None else []) + ["-"]
+    return argv + (["--target", target] if target else []) + ["-"]
 
 
 class Jitter:
@@ -109,6 +127,10 @@ class Jitter:
         return True
 
 
-def capture_argv() -> list[str]:
-    return ["pw-cat", "--record", "--target", SINK, "-P", "{ stream.capture.sink=true }", "--format", "s16",
+def sink_name(make_default: bool = True) -> str:
+    return SINK if make_default else PONTE
+
+
+def capture_argv(name: str = SINK) -> list[str]:
+    return ["pw-cat", "--record", "--target", name, "-P", "{ stream.capture.sink=true }", "--format", "s16",
             "--rate", str(RATE), "--channels", str(CHANNELS), "--latency", "10ms", "-"]

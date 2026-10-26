@@ -132,7 +132,9 @@ class Daemon:
         self.pending: dict[str, Conn] = {}
         self.pair_hits: dict[str, collections.deque] = {}
         self.audio_conn: Conn | None = None
-        self.audio_out_previous = None  # saída padrão de antes do "Nexus → …" (o áudio de volta não ecoa no aparelho)
+        self.audio_out_previous = None  # node.name da saída padrão de antes do "Nexus → …" (sem eco no aparelho)
+        self.audio_sink = None  # node.name do "Nexus → …" enquanto há um dispositivo ouvindo
+        self.audio_quiet: set[str] = set()  # dispositivo que vai ouvir outro: a saída dele não vira a padrão do PC
         self.audio_in: dict[str, Conn] = {}  # device_id → conexão audio.push: vários ao mesmo tempo
         self.audio_in_asked: dict[str, float] = {}  # device_id → prazo monotônico do pedido do PC
         self.asking: set[tuple[str, str]] = set()  # (dispositivo, permissão) com a pergunta "Permitir?" na tela
@@ -501,20 +503,23 @@ class Daemon:
             raise ProtocolError("unauthorized", "dispositivo não pareado")
         if self.audio_conn is not None:
             self.audio_conn.close()  # um fluxo de áudio por vez: o novo assume
-        self.audio_conn = conn
+        self.audio_conn, self.audio_sink = conn, None  # o nó antigo some: ninguém deve rotear para ele
         from nexus import audio
+        quiet = conn.device_id in self.audio_quiet
+        self.audio_quiet.discard(conn.device_id)
         try:
-            nid, previous = await asyncio.to_thread(audio.start, conn.record["name"])
+            nid, previous = await asyncio.to_thread(audio.start, conn.record["name"], not quiet)
         except Exception as e:
             self.audio_conn = None
             raise ProtocolError("audio_failed", f"PipeWire: {type(e).__name__}")
-        self.audio_out_previous = previous
+        self.audio_out_previous = await asyncio.to_thread(audio.node_name, previous)
+        self.audio_sink = audio.sink_name(not quiet)
         proc = None
         log_event({"event": "audio.start", "device_id": conn.device_id})
         self.emit({"event": "audio.changed", "device_id": conn.device_id, "on": True})
         try:
-            proc = await asyncio.create_subprocess_exec(*audio.capture_argv(), stdout=asyncio.subprocess.PIPE,
-                                                        stderr=asyncio.subprocess.DEVNULL)
+            argv = audio.capture_argv(audio.sink_name(not quiet))
+            proc = await asyncio.create_subprocess_exec(*argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
             await conn.send(make("audio.ready", {"rate": audio.RATE, "channels": audio.CHANNELS, "format": "s16le"}, re=rid))
             # write/drain não falham num transporte já fechado: sem este teste o loop nunca terminaria
             while not conn.writer.is_closing():
@@ -527,7 +532,7 @@ class Daemon:
                 await proc.wait()
             await asyncio.to_thread(audio.stop, nid, previous)
             if self.audio_conn is conn:
-                self.audio_conn = None
+                self.audio_conn = self.audio_sink = None
             log_event({"event": "audio.stop", "device_id": conn.device_id})
             self.emit({"event": "audio.changed", "device_id": conn.device_id, "on": False})
 
@@ -539,8 +544,13 @@ class Daemon:
         dev = conn.device_id
         if (body["rate"], body["channels"], body["format"]) != (audio.RATE, audio.CHANNELS, "s16le"):
             raise ProtocolError("bad_format", "mande s16le, 48 kHz, estéreo")
-        asked = self.audio_in_asked.pop(dev, 0) > time.monotonic()
-        if not asked:
+        route = None
+        if body.get("to") is not None:  # para outro dispositivo: toca na saída "Nexus → …" dele, não no PC
+            dest = self._relay_target(conn, body["to"])
+            await self._ask(conn, RELAY, "{name} quer mandar a outro aparelho", "{name} quer mandar o áudio dele para o "
+                            + (dest.record.get("alias") or dest.record["name"])[:60] + ".", RELAY_ASK)
+            route = await self._audio_route(dest)
+        elif not self.audio_in_asked.pop(dev, 0) > time.monotonic():
             await self._ask(conn, AUDIO_IN, "Áudio de {name}", "{name} quer tocar o áudio dele neste PC.")
         old = self.audio_in.get(dev)
         if old is not None:
@@ -549,6 +559,8 @@ class Daemon:
         # o aparelho também ouve o PC: o áudio dele toca na saída de antes, senão voltaria para ele com atraso
         # ponytail: decidido na partida; se o "Áudio aqui" ligar depois, o eco volta até reabrir este fluxo
         target = self.audio_out_previous if self.audio_conn is not None and self.audio_conn.device_id == dev else None
+        if route is not None:
+            target = route[0]
         proc = None
         log_event({"event": "audio.in.start", "device_id": dev})
         self.emit({"event": "audio.in.changed", "device_id": dev, "on": True})
@@ -574,6 +586,8 @@ class Daemon:
                     await proc.wait()
             if self.audio_in.get(dev) is conn:
                 del self.audio_in[dev]
+            if route is not None and route[1] is not None and self.audio_conn is route[1]:
+                route[1].close()  # o destino só ouvia por causa deste fluxo: para junto
             log_event({"event": "audio.in.stop", "device_id": dev})
             self.emit({"event": "audio.in.changed", "device_id": dev, "on": False})
 
@@ -598,6 +612,20 @@ class Daemon:
             self.emit({"event": "device.changed", "device_id": dev})
         elif answer != "uma":
             raise ProtocolError("forbidden", "o PC não permitiu")
+
+    async def _audio_route(self, dest: Conn) -> tuple[str, "Conn | None"]:
+        """Garante que `dest` está ouvindo (pede o audio.start, sem trocar a saída padrão do PC) e devolve
+        (node.name do "Nexus → dest", a conexão de áudio aberta aqui ou None se ele já ouvia o PC)."""
+        if self.audio_conn is not None and self.audio_conn.device_id == dest.device_id and self.audio_sink is not None:
+            return self.audio_sink, None
+        self.audio_quiet.add(dest.device_id)
+        await dest.send(make("audio.start", {}))
+        for _ in range(100):  # o destino abre a conexão de áudio (audio.attach) por conta própria
+            if self.audio_conn is not None and self.audio_conn.device_id == dest.device_id and self.audio_sink is not None:
+                return self.audio_sink, self.audio_conn
+            await asyncio.sleep(0.05)
+        self.audio_quiet.discard(dest.device_id)
+        raise ProtocolError("offline", "o outro aparelho não abriu o áudio")
 
     def _peers_of(self, conn: Conn) -> list:
         return [{"device_id": r["device_id"], "name": r.get("alias") or r["name"], "kind": r["kind"],

@@ -23,11 +23,15 @@ class AudioSender(private val ctx: Context, private val onEnd: () -> Unit, priva
     @Volatile private var projection: MediaProjection? = null
 
     val sending get() = worker?.isAlive == true
+    /** Outro aparelho que toca o áudio daqui (pelo PC); null = o próprio PC. */
+    @Volatile var to: Peer? = null
+        private set
 
     /** `mp` vem da confirmação do usuário; este objeto passa a ser o dono dela e a encerra ao parar. */
-    fun start(mp: MediaProjection) {
+    fun start(mp: MediaProjection, to: Peer? = null) {
         if (sending) { mp.stop(); return }
         projection = mp
+        this.to = to
         // o usuário pode parar pelo próprio Android (chip de gravação): para junto
         mp.registerCallback(object : MediaProjection.Callback() { override fun onStop() { stop() } }, Handler(Looper.getMainLooper()))
         worker = thread(name = "nexus-audio-out") {
@@ -39,6 +43,7 @@ class AudioSender(private val ctx: Context, private val onEnd: () -> Unit, priva
             }
             session = null
             projection?.let { projection = null; runCatching { it.stop() } }
+            this.to = null
             onStatus(msg)
             onEnd()
         }
@@ -72,9 +77,10 @@ class AudioSender(private val ctx: Context, private val onEnd: () -> Unit, priva
             Session(host, PORT, Identity.load(), pin = pin, presentCert = true).use { s ->
                 session = s
                 s.timeoutMs = 75_000 // sem a permissão, o PC pergunta ao usuário (até 60 s)
-                s.request("audio.push", JSONObject().put("rate", RATE).put("channels", 2).put("format", "s16le"), "audio.ready")
+                s.request("audio.push", JSONObject().put("rate", RATE).put("channels", 2).put("format", "s16le")
+                    .apply { to?.let { put("to", it.id) } }, "audio.ready")
                 rec.startRecording()
-                onStatus("Mandando o áudio para o PC")
+                onStatus("Mandando o áudio para o ${to?.name ?: "PC"}")
                 val buf = ByteArray(BLOCK)
                 while (session === s) {
                     var off = 0

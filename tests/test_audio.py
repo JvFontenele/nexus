@@ -15,9 +15,9 @@ class TestJitter(unittest.TestCase):
         self.assertEqual([j.admit() for _ in range(4)], [True, True, True, True])
 
     def test_props_sem_injecao(self):
-        argv = audio.playback_argv('POCO "x" }{ y', "abc", target=7)
+        argv = audio.playback_argv('POCO "x" }{ y', "abc", target="nexus-ponte")
         self.assertNotIn('"x"', argv[3])
-        self.assertEqual(argv[-3:], ["--target", "7", "-"])
+        self.assertEqual(argv[-3:], ["--target", "nexus-ponte", "-"])
 
 
 if __name__ == "__main__":

@@ -40,7 +40,7 @@ Repositórios de referência (Beamer, Coucou, Zorin Connect) e o commit estudado
 
 ## Rodar, testar e compilar
 ```bash
-python3 -m unittest discover -s tests                       # 186 testes (inclui TLS real e D-Bus em barramento privado)
+python3 -m unittest discover -s tests                       # 187 testes (inclui TLS real e D-Bus em barramento privado)
 cd ../pesquisa-linux && tests/aninhado.sh                   # 36 testes do Balão num GNOME Shell aninhado (abre uma janela)
 cd android && JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 ~/.local/opt/gradle-9.8.2/bin/gradle -q assembleDebug
 adb install -r android/app/build/outputs/apk/debug/app-debug.apk

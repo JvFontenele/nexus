@@ -562,7 +562,7 @@ class TestDaemon(unittest.TestCase):
                     break
                 time.sleep(0.02)
             stop.assert_called_once_with(1, 2)  # saída padrão restaurada
-            start.assert_called_once_with("teste")
+            start.assert_called_once_with("teste", True)
         u = self.client(self.tablet, present=False)
         u.send("audio.attach", {})
         self.assertEqual(u.recv()["body"]["code"], "unauthorized")
@@ -672,6 +672,50 @@ class TestDaemon(unittest.TestCase):
             time.sleep(0.02)
         c.send("relay", {"to": fp_tablet, "kind": "text", "value": "oi"})
         self.assertFalse(c.recv()["body"]["ok"])  # revogado: não pareado
+
+    def test_audio_to_other_device(self):
+        import struct as st
+        import sys
+        from unittest import mock
+        from nexus.proto.identity import device_id
+        c = self.pair()
+        t = self.pair(self.tablet)
+        fp_tablet = device_id(self.tablet[0])
+        self.assertTrue(self.call(self.d._control_cmd({"cmd": "devices.allow", "device_id": self.fp_phone,
+                                                         "action": "devices.relay"}))["ok"])
+        zeros = [sys.executable, "-c", "import sys,time\nwhile True: sys.stdout.buffer.write(bytes(1920)); sys.stdout.flush(); time.sleep(0.01)"]
+        sink = [sys.executable, "-c", "import sys\nwhile sys.stdin.buffer.read1(65536): pass"]
+        fmt = {"rate": 48000, "channels": 2, "format": "s16le"}
+        with mock.patch("nexus.audio.start", return_value=(7, None)) as start, mock.patch("nexus.audio.stop"), \
+                mock.patch("nexus.audio.capture_argv", return_value=zeros) as capture, \
+                mock.patch("nexus.audio.playback_argv", return_value=sink) as argv:
+            a = self.client(self.phone)
+            a.send("audio.push", {**fmt, "to": fp_tablet})
+            self.assertEqual(t.recv()["type"], "audio.start")  # o PC liga o áudio no tablet
+            tb = self.client(self.tablet)
+            tb.send("audio.attach", {})
+            self.assertEqual(tb.recv()["type"], "audio.ready")
+            self.assertEqual(a.recv()["body"], fmt)
+            start.assert_called_once_with("teste", False)  # a saída do tablet não vira a padrão do PC
+            capture.assert_called_once_with("nexus-ponte")  # nem tem o nome que o WirePlumber lembra como padrão
+            self.assertEqual(argv.call_args[0][2], "nexus-ponte")  # o celular toca na saída do tablet (pelo nome)
+            a.raw(st.pack(">I", 1920) + bytes(1920))
+            a.s.close()
+            for _ in range(200):  # o celular parou: o tablet, que só ouvia por isso, para junto
+                if self.d.audio_conn is None:
+                    break
+                time.sleep(0.02)
+            self.assertIsNone(self.d.audio_conn)
+            ended = False
+            try:  # o tablet ainda tem quadros no caminho: lê até a conexão acabar
+                while tb.s.recv(65536):
+                    pass
+                ended = True
+            except OSError:
+                ended = True
+            self.assertTrue(ended)
+        c.send("ping", {})
+        self.assertEqual(c.recv()["type"], "pong")
 
     def test_file_push_and_pull(self):
         import struct as st

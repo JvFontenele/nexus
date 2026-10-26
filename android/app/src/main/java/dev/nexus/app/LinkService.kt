@@ -71,11 +71,11 @@ class LinkService : Service(), Pc {
     }
 
     /** A tela recebeu a confirmação do usuário: começa a mandar o áudio deste aparelho para o PC. */
-    fun startAudioOut(resultCode: Int, data: Intent) {
+    fun startAudioOut(resultCode: Int, data: Intent, to: Peer? = null) {
         tipo(true).getOrElse { throw ProtocolException("o Android recusou a captura: ${it.message}") }
         val mp = getSystemService(android.media.projection.MediaProjectionManager::class.java).getMediaProjection(resultCode, data)
             ?: throw ProtocolException("a confirmação expirou")
-        audioOut.start(mp)
+        audioOut.start(mp, to)
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -231,7 +231,10 @@ class LinkService : Service(), Pc {
         @Volatile var lastAudioOutText: String? = null
         fun stopAudioOut() { current?.audioOut?.stop() }
         /** null se a conexão persistente não estiver ativa. */
-        fun startAudioOut(resultCode: Int, data: Intent): Boolean? = current?.let { it.startAudioOut(resultCode, data); true }
+        fun startAudioOut(resultCode: Int, data: Intent, to: Peer? = null): Boolean? =
+            current?.let { it.startAudioOut(resultCode, data, to); true }
+        /** Para onde vai o áudio daqui agora: outro aparelho, ou null (o PC ou nada). */
+        fun audioTarget(): Peer? = current?.audioOut?.to
         const val ACTION_MANDAR_AUDIO = "dev.nexus.app.MANDAR_AUDIO"
         private const val PEDIDO_AUDIO = 7
 
