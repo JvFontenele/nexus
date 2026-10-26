@@ -201,14 +201,18 @@ class LinkService : Service(), Pc {
         private const val CH_LINK = "link"
         private const val CH_PUSH = "push"
 
-        /** O PC controla este aparelho: UHID do scrcpy-server do Nexus ou do scrcpy em janela (detecção só local). */
-        fun pcControlando(ctx: Context): Boolean {
+        private fun temEntrada(ctx: Context, nome: (String) -> Boolean): Boolean {
             val im = ctx.getSystemService(InputManager::class.java)
-            return im.inputDeviceIds.any { id ->
-                val n = im.getInputDevice(id)?.name ?: return@any false
-                n == "Nexus teclado" || n == "Nexus mouse" || n.contains("scrcpy", ignoreCase = true)
-            }
+            return im.inputDeviceIds.any { id -> im.getInputDevice(id)?.name?.let(nome) == true }
         }
+
+        /** O PC controla este aparelho: UHID do scrcpy-server, scrcpy em janela ou o PC como teclado/mouse Bluetooth. */
+        fun pcControlando(ctx: Context): Boolean = temEntrada(ctx) { n ->
+            n in setOf("Nexus teclado", "Nexus mouse", "Nexus Keyboard", "Nexus Mouse") || n.contains("scrcpy", ignoreCase = true)
+        }
+
+        /** O PC como teclado Bluetooth (HOGP): o Android não lhe dá layout e cai no inglês (EUA). */
+        fun tecladoBluetooth(ctx: Context): Boolean = temEntrada(ctx) { it == "Nexus Keyboard" }
 
         /** Clique automático da Acessibilidade (só leitura; o Nexus nunca muda essa configuração). */
         fun cliqueAutomatico(ctx: Context): Boolean = runCatching {

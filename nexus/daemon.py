@@ -611,8 +611,9 @@ class Daemon:
     # ── travessia do teclado e do mouse (nexus/kvm.py) ───────────────────
     def _input_status(self) -> dict:
         k, o = self.kvm, self.owner
-        trav = k.get("travessia") if k else None
-        return {"active": k["device_id"] if k else None, "away": bool(trav and trav.away),
+        mux = k.get("mux") if k else None
+        return {"active": bool(k), "targets": sorted(mux.targets) if mux else [],
+                "current": mux.current if mux else None, "away": bool(mux and mux.away),
                 "owner": o["device_id"] if o else None}
 
     def _target(self, dev_id: str):
@@ -623,6 +624,12 @@ class Daemon:
             return self.peers, self.peers.records[dev_id]
         return None, None
 
+    def _arranged(self) -> list:
+        """(store, registro) de todos os alvos com arranjo e permissão: entram na borda."""
+        out = [(self.store, r) for r in self.store.records.values()
+               if r.get("arrangement") and INPUT_CONTROL in r["permissions"]]
+        return out + [(self.peers, r) for r in self.peers.records.values() if r.get("arrangement")]
+
     def _input_config(self, req: dict) -> dict:
         dev_id = str(req.get("device_id"))
         store, rec = self._target(dev_id)
@@ -632,85 +639,144 @@ class Daemon:
             arr = check_arrangement(req)
         except ValueError as e:
             return {"ok": False, "error": str(e)}
+        for other in list(self.store.records.values()) + list(self.peers.records.values()):
+            o = other.get("arrangement")
+            if (other["device_id"] != dev_id and o and o["edge"] == arr["edge"] and o["monitor"] == arr["monitor"]
+                    and arr["start"] < o["end"] and o["start"] < arr["end"]):
+                return {"ok": False, "error": f"esse trecho da borda já é do {other['name']}"}
         store.update(dev_id, "arrangement", arr)
         return {"ok": True}
 
-    async def _input_start(self, dev_id: str) -> dict:
-        """"Ativar borda": prepara o alvo (scrcpy-server no celular ou input.attach no outro PC) e abre a
-        sessão InputCapture só agora (o GNOME pergunta ao usuário)."""
-        store, rec = self._target(dev_id)
-        if rec is None:
-            return {"ok": False, "error": "dispositivo não pareado"}
-        is_pc = store is self.peers
-        if not is_pc and INPUT_CONTROL not in rec["permissions"]:
-            return {"ok": False, "error": "controle não liberado para este dispositivo"}
-        arr = rec.get("arrangement")
-        if not arr:
-            return {"ok": False, "error": "posicione o dispositivo ao lado de um monitor primeiro"}
+    async def _open_sink(self, store, rec, session, loop):
+        """Abre o alvo: scrcpy-server no celular/tablet, input.attach no outro PC."""
+        from nexus import android_input, peer
+        from nexus.actions import desktop
+        dev_id = rec["device_id"]
+        lost = lambda *reason: self._target_lost(session, dev_id, reason[0] if reason else "adb/scrcpy caiu")
+        if store is self.peers:
+            sink = peer.PeerSink(rec, self.cert, self.key, on_lost=lost,
+                                 on_home=lambda frac: session["mux"].targets.get(dev_id) and
+                                 session["mux"].targets[dev_id].remote_home(frac))
+        else:
+            conn = self.by_device.get(dev_id)
+            serial, err = await asyncio.to_thread(desktop._adb_device, rec["name"], conn.ip if conn else None)
+            if err:
+                raise RuntimeError(err)
+            sink = android_input.AndroidInput(serial, on_lost=lost, on_rotate=lambda size: loop.call_soon_threadsafe(
+                self._set_screen, dev_id, size))
+        try:
+            await asyncio.to_thread(sink.start)
+        except Exception:
+            sink.close()
+            raise
+        return sink
+
+    async def _input_start(self, _dev_id=None) -> dict:
+        """"Ativar borda": vale para todos os alvos arranjados e com permissão. Uma sessão InputCapture (só
+        agora: o GNOME pergunta), uma barreira por alvo, um alvo ativo por vez."""
         if self.owner:  # anti-laço: um PC controlado não controla ninguém
             return {"ok": False, "error": "este PC está sendo controlado por outro agora"}
         if self.kvm:
             return {"ok": False, "error": "a borda já está ativa"}
-        session = {"device_id": dev_id}
-        self.kvm = session  # reservado antes de qualquer await: dois input.start nunca passam juntos
-        from nexus import android_input, capture, kvm, peer
-        from nexus.actions import desktop
+        cands = self._arranged()
+        if not cands:
+            return {"ok": False, "error": "posicione um dispositivo ao lado de um monitor primeiro"}
+        from nexus import capture, kvm
         loop = asyncio.get_running_loop()
-
-        def lost(*_):  # adb, scrcpy ou o outro PC caiu: traz a entrada de volta e encerra a sessão inteira
-            if "travessia" in session:
-                session["travessia"].sink_lost()
-                threading.Thread(target=session["capture"].stop, daemon=True).start()
-
-        def crossed(away, reason=None):
-            self.emit({"event": "input.crossed", "device_id": dev_id, "away": away, "active": True, "reason": reason})
-
-        def ended(reason):
-            loop.call_soon_threadsafe(self._input_ended, session, reason)
-
-        try:
-            if is_pc:
-                sink = peer.PeerSink(rec, self.cert, self.key, on_lost=lost,
-                                     on_home=lambda frac: session["travessia"].remote_home(frac))
-            else:
-                conn = self.by_device.get(dev_id)
-                serial, err = await asyncio.to_thread(desktop._adb_device, rec["name"], conn.ip if conn else None)
-                if err:
-                    raise RuntimeError(err)
-                sink = android_input.AndroidInput(serial, on_lost=lost)
+        session = {}
+        self.kvm = session  # reservado antes de qualquer await: dois input.start nunca passam juntos
+        session["mux"] = mux = kvm.Mux(lambda p: session["capture"].release(p),
+                                       on_end=lambda reason: loop.call_soon_threadsafe(self._input_ended, session, reason),
+                                       on_unplaced=lambda keys: [self._target_lost(session, k, "a barreira não coube") for k in keys])
+        opened, failures, warnings = [], {}, []
+        for store, rec in cands:  # um de cada vez: o adb e o diálogo do outro PC não gostam de pressa
             try:
-                await asyncio.to_thread(sink.start)
-            except Exception:
-                sink.close()
-                raise
-        except Exception as e:  # versão do scrcpy, adb fora do ar, outro PC recusou ou não respondeu
+                sink = await self._open_sink(store, rec, session, loop)
+            except Exception as e:  # versão do scrcpy, adb fora do ar, outro PC recusou ou não respondeu
+                failures[rec["name"]] = str(e) or type(e).__name__
+                continue
+            opened.append((store, rec, sink))
+            if store is self.peers and getattr(sink, "zones", None):
+                zs = sink.zones
+                self._set_screen(rec["device_id"], (max(z[0] + z[2] for z in zs) - min(z[0] for z in zs),
+                                                    max(z[1] + z[3] for z in zs) - min(z[1] for z in zs)))
+            elif store is self.store:
+                self._set_screen(rec["device_id"], sink.size)
+                if await asyncio.to_thread(sink.autoclick_on):
+                    warnings.append(f"{rec['name']}: {AUTOCLICK_WARNING}")
+        if not opened:
             self.kvm = None
-            return {"ok": False, "error": str(e) or type(e).__name__}
-        region = (tuple(arr["monitor"]), arr["start"], arr["end"])
-        session["travessia"] = kvm.Travessia(arr["edge"], sink, lambda p: session["capture"].release(p),
-                                             start=arr["start"], end=arr["end"], on_change=crossed, on_end=ended)
-        session["capture"] = capture.Capture(arr["edge"], session["travessia"], region=region)
+            return {"ok": False, "error": "; ".join(f"{n}: {e}" for n, e in failures.items())}
+        regions = []
+        for store, rec, sink in opened:
+            dev_id, arr = rec["device_id"], rec["arrangement"]
+
+            def crossed(away, reason=None, dev_id=dev_id):
+                self.emit({"event": "input.crossed", "device_id": dev_id, "away": away, "active": True, "reason": reason})
+            mux.add(dev_id, kvm.Travessia(arr["edge"], sink, mux._release, start=arr["start"], end=arr["end"],
+                                          on_change=crossed))
+            regions.append((dev_id, arr["edge"], (tuple(arr["monitor"]), arr["start"], arr["end"])))
+        session["regions"] = regions
+        session["capture"] = capture.Capture(regions, mux)
         session["capture"].start()
-        log_event({"event": "input.start", "device_id": dev_id})
-        warning = None
-        if not is_pc and await asyncio.to_thread(sink.autoclick_on):
-            warning = AUTOCLICK_WARNING
-        self.emit({"event": "input.crossed", "device_id": dev_id, "away": False, "active": True,
-                   **({"warning": warning} if warning else {})})
-        return {"ok": True, **({"warning": warning} if warning else {})}
+        log_event({"event": "input.start", "targets": [r["device_id"] for _s, r, _k in opened]})
+        for _s, rec, _k in opened:
+            self.emit({"event": "input.crossed", "device_id": rec["device_id"], "away": False, "active": True})
+        warnings += [f"{n}: {e}" for n, e in failures.items()]
+        return {"ok": True, "targets": [r["device_id"] for _s, r, _k in opened],
+                **({"warning": "\n".join(warnings)} if warnings else {})}
+
+    def _target_lost(self, session: dict, dev_id: str, reason: str):
+        """Um alvo caiu (qualquer thread): sai só a barreira dele; sem alvos, a sessão acaba."""
+        mux = session.get("mux")
+        if mux is None or dev_id not in mux.targets:
+            return
+        left = mux.drop(dev_id)
+        session["regions"] = [r for r in session.get("regions", []) if r[0] != dev_id]
+        self.emit({"event": "input.crossed", "device_id": dev_id, "away": False, "active": False, "reason": reason})
+        cap = session.get("capture")
+        if cap is not None:
+            if left:
+                cap.set_regions(session["regions"])
+            else:
+                threading.Thread(target=cap.stop, daemon=True).start()
+
+    def _set_screen(self, dev_id: str, size):
+        """Guarda o tamanho lógico atual da tela do alvo (proporção no editor quando não houver adb)."""
+        store, rec = self._target(dev_id)
+        if rec is not None and size and list(size) != rec.get("screen"):
+            store.update(dev_id, "screen", [int(size[0]), int(size[1])])
+            self.emit({"event": "input.screen", "device_id": dev_id, "screen": [int(size[0]), int(size[1])]})
+
+    async def _input_screen(self, dev_id: str) -> dict:
+        """Lê agora, pelo adb, o tamanho da tela do celular/tablet (com a rotação) e guarda."""
+        store, rec = self._target(dev_id)
+        if rec is None:
+            return {"ok": False, "error": "dispositivo não pareado"}
+        if store is self.store:
+            from nexus import android_input
+            from nexus.actions import desktop
+            serial = await asyncio.to_thread(desktop.adb_serial, rec["name"])
+            size = serial and await asyncio.to_thread(android_input.read_screen, serial)
+            if size:
+                self._set_screen(dev_id, size)
+        return {"ok": True, "screen": rec.get("screen")}
 
     def _input_ended(self, session: dict, reason):
         if self.kvm is session:
             self.kvm = None
-        log_event({"event": "input.stop", "device_id": session["device_id"]})
-        self.emit({"event": "input.crossed", "device_id": session["device_id"], "away": False, "active": False,
-                   "reason": reason})
+        log_event({"event": "input.stop"})
+        self.emit({"event": "input.crossed", "device_id": None, "away": False, "active": False, "reason": reason})
 
     async def _input_stop_for(self, dev_id: str | None):
-        """Encerra a borda (de qualquer dispositivo com None). Fechar a sessão devolve a entrada ao PC."""
+        """Encerra a borda inteira (None) ou só tira um alvo dela. Fechar a sessão devolve a entrada ao PC."""
         k = self.kvm
-        if k and "capture" in k and (dev_id is None or k["device_id"] == dev_id):
+        if not k or "capture" not in k:
+            return
+        if dev_id is None:
             await asyncio.to_thread(k["capture"].stop)
+        elif dev_id in k["mux"].targets:
+            await asyncio.to_thread(self._target_lost, k, dev_id, "permissão retirada")
 
     # ── PC↔PC, lado controlado (nexus/inject.py, kvmwire.py) ─────────────
     async def _input_attach(self, conn: Conn, rid: str):
@@ -886,10 +952,11 @@ class Daemon:
             return await self.confirm(str(req.get("pid")), bool(req.get("accept")))
         if cmd == "devices.list":
             return {"ok": True, "devices": [{**{k: r[k] for k in ("device_id", "name", "kind", "paired_at", "permissions")},
-                                             "arrangement": r.get("arrangement")}
+                                             "arrangement": r.get("arrangement"), "screen": r.get("screen")}
                                             for r in self.store.records.values()]
                                + [{"device_id": r["device_id"], "name": r["name"], "kind": "pc", "paired_at": r["paired_at"],
-                                   "permissions": [INPUT_CONTROL], "arrangement": r.get("arrangement"), "peer": True}
+                                   "permissions": [INPUT_CONTROL], "arrangement": r.get("arrangement"),
+                                   "screen": r.get("screen"), "peer": True}
                                   for r in self.peers.records.values()],
                     "input": self._input_status(),
                     "connected": sorted(self.by_device),
@@ -899,6 +966,8 @@ class Daemon:
             return {"ok": self.revoke(str(req.get("device_id")))}
         if cmd == "input.status":
             return {"ok": True, **self._input_status()}
+        if cmd == "input.screen":
+            return await self._input_screen(str(req.get("device_id")))
         if cmd == "input.config":
             return self._input_config(req)
         if cmd == "input.start":

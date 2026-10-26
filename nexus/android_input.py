@@ -21,6 +21,7 @@ SERVER_VERSION = "5.0.1"
 REMOTE_PATH = "/data/local/tmp/nexus-scrcpy-server.jar"
 _SERIAL = re.compile(r"[A-Za-z0-9._:-]{1,64}")
 CONNECT_SECONDS = 8.0
+ROTATION_SECONDS = 2.0
 MAX_CLIPBOARD = 1 << 20  # o servidor limita a menos que isto; acima, é lixo e a conexão cai
 
 # mensagens de controle (cliente → servidor)
@@ -106,15 +107,59 @@ def set_clipboard(seq: int, text: str) -> bytes:
 
 _ACCEL = re.compile(r"PointerVelocityControlParameters: scale=([\d.]+), lowThreshold=([\d.]+), "
                     r"highThreshold=([\d.]+), acceleration=([\d.]+)")
+_CURVE_ROW = re.compile(r"\{(inf|[\d.]+), ([\d.]+), (-?[\d.]+)\}")
+_VIEWPORT = re.compile(r"Viewport INTERNAL: displayId=0,[^\n]*?orientation=(\d)[^\n]*?logicalFrame=\[0, 0, (\d+), (\d+)\]")
+
+
+def _mouse_section(dump: str) -> str:
+    """O trecho do `dumpsys input` do nosso mouse UHID (até o próximo dispositivo)."""
+    m = re.search(r"\n  Device \d+: Nexus mouse\n", dump)  # a seção do InputReader, não a lista do EventHub
+    if not m:
+        return ""
+    i = m.end()
+    j = dump.find("\n  Device ", i)
+    return dump[i:j if j > 0 else len(dump)]
 
 
 def parse_accel(dump: str):
-    """(scale, low, high, acceleration) do mouse, do `dumpsys input`; None se não achar ou for absurdo."""
-    m = _ACCEL.search(dump)
+    """Aceleração do mouse no `dumpsys input` (formato de nexus/kvm.Aceleracao); None se não achar ou for absurdo.
+    Android 15+ (One UI 7/8): "XScale" e "Acceleration Curve" na seção do mouse. Android ≤ 14:
+    "PointerVelocityControlParameters"."""
+    sec = _mouse_section(dump)
+    if "Acceleration Curve" in sec:
+        xs = re.search(r"XScale: ([\d.]+)", sec)
+        rows = [(float("inf") if a == "inf" else float(a), float(b), float(c))
+                for a, b, c in _CURVE_ROW.findall(sec[sec.index("Acceleration Curve"):])]
+        xscale = float(xs.group(1)) if xs else 1.0
+        if rows and 0 < xscale <= 20 and all(0 < r[1] <= 50 and r[0] > 0 for r in rows) and rows[-1][0] == float("inf"):
+            enabled = "Mouse pointer acceleration enabled: false" not in dump
+            return {"xscale": xscale, "enabled": enabled, "curve": rows}
+    m = _ACCEL.search(sec) or _ACCEL.search(dump)
     if not m:
         return None
     scale, low, high, acc = (float(x) for x in m.groups())
     return (scale, low, high, acc) if 0 < scale <= 20 and 0 <= low < high and 1 <= acc <= 20 else None
+
+
+def parse_screen(dump: str):
+    """Tamanho lógico atual da tela (já com a rotação) do viewport interno; None se não achar."""
+    m = _VIEWPORT.search(dump)
+    if not m:
+        return None
+    w, h = int(m.group(2)), int(m.group(3))
+    return (w, h) if 0 < w <= 20000 and 0 < h <= 20000 else None
+
+
+def read_screen(serial: str, adb: str = "adb"):
+    """Tamanho lógico atual da tela (com a rotação), lido agora pelo adb; None se falhar. Argumentos fixos."""
+    if not _SERIAL.fullmatch(serial):
+        return None
+    try:
+        out = subprocess.run([adb, "-s", serial, "shell", "dumpsys input | grep -m1 'Viewport INTERNAL: displayId=0'"],
+                             capture_output=True, text=True, timeout=10).stdout
+    except (subprocess.SubprocessError, OSError):
+        return None
+    return parse_screen(out)
 
 
 class HidState:
@@ -192,10 +237,10 @@ class AndroidInput:
     """Sessão de controle com um celular. `on_lost()` é chamado (de outra thread) se o adb ou o servidor
     cair: quem usa deve trazer a entrada de volta ao PC."""
 
-    def __init__(self, serial: str, on_lost=lambda: None, adb: str = "adb"):
+    def __init__(self, serial: str, on_lost=lambda: None, adb: str = "adb", on_rotate=lambda size: None):
         if not _SERIAL.fullmatch(serial):
             raise ValueError("serial inválido")
-        self.serial, self.on_lost, self.adb = serial, on_lost, adb
+        self.serial, self.on_lost, self.adb, self.on_rotate = serial, on_lost, adb, on_rotate
         self.hid = HidState()
         self.size = (1080, 2400)
         self.accel = (1.0, 500.0, 3000.0, 3.0)  # VelocityControl do Android (padrão AOSP); lido no start()
@@ -231,13 +276,19 @@ class AndroidInput:
         self._proc = subprocess.Popen([self.adb, "-s", self.serial, "shell", cmd], stdin=subprocess.DEVNULL,
                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         self._sock = self._connect()
-        self.size = self._screen_size()
-        self.accel = parse_accel(self._adb("shell", "dumpsys", "input", timeout=15)) or self.accel
         with self._lock:
             self._sock.sendall(uhid_create(KEYBOARD_ID, "Nexus teclado", KEYBOARD_DESC)
                                + uhid_create(MOUSE_ID, "Nexus mouse", MOUSE_DESC))
+        for _ in range(6):  # o Android leva um instante para registrar o mouse UHID (a curva fica na seção dele)
+            time.sleep(0.5)
+            dump = self._adb("shell", "dumpsys", "input", timeout=15)
+            if "Nexus mouse" in dump:
+                break
+        self.accel = parse_accel(dump) or self.accel
+        self.size = parse_screen(dump) or self._screen_size()
         threading.Thread(target=self._reader, name="nexus-scrcpy", daemon=True).start()
         threading.Thread(target=self._watch, name="nexus-adb", daemon=True).start()
+        threading.Thread(target=self._rotation, name="nexus-rotacao", daemon=True).start()
 
     def _connect(self):
         # com o forward do adb, o connect funciona mesmo sem servidor: só o byte inicial prova que ele está lá
@@ -262,7 +313,20 @@ class AndroidInput:
         self.close()
         raise RuntimeError("o scrcpy-server não respondeu")
 
+    def screen(self):
+        return read_screen(self.serial, self.adb)
+
+    def _rotation(self):
+        # o scrcpy-server sem vídeo não avisa de rotação: relê o viewport a cada ROTATION_SECONDS
+        while not self._closed:
+            time.sleep(ROTATION_SECONDS)
+            size = None if self._closed else self.screen()
+            if size and size != self.size:
+                self.size = size
+                self.on_rotate(size)
+
     def _screen_size(self):
+        # `wm size` dá o tamanho natural (sem rotação): só se o dumpsys não trouxer o viewport
         out = self._adb("shell", "wm", "size", timeout=10)
         sizes = re.findall(r"(\d+)x(\d+)", out)  # "Override size" (se houver) vem por último
         return (int(sizes[-1][0]), int(sizes[-1][1])) if sizes else self.size

@@ -60,31 +60,55 @@ class Push:
         self._hits.clear()
 
 
+COUNTS_PER_MM = 800 / 25.4  # o Android 15+ supõe um mouse de 800 DPI para converter a curva em mm/s
+
+
 class Aceleracao:
-    """Modelo do VelocityControl do Android: o ganho do mouse cresce com a velocidade (contagens/s),
-    de `scale` abaixo de `low` até scale*acceleration acima de `high`. Os parâmetros vêm do
-    `dumpsys input` do aparelho. Serve para estimar onde está o cursor do celular."""
+    """Modelo da aceleração do mouse no Android, para estimar onde está o cursor. Dois formatos, como
+    o `dumpsys input` do aparelho mostra (nexus/android_input.parse_accel):
+    - Android ≤ 14, VelocityControl: tupla (scale, low, high, acceleration); ganho `scale` abaixo de `low`
+      contagens/s até scale × acceleration acima de `high`;
+    - Android 15+, curva: {"xscale", "enabled", "curve": [(max mm/s, baseGain, reciprocal), …]}; as
+      contagens são multiplicadas por xscale e o ganho é baseGain + reciprocal / velocidade (mm/s)."""
 
     def __init__(self, params=(1.0, 500.0, 3000.0, 3.0), clock=time.monotonic):
-        self.scale, self.low, self.high, self.acc = params
+        self.params = params
         self._clock = clock
         self._hist = collections.deque()
+
+    def speed_gain(self, speed) -> float:
+        """Ganho total (pixels por contagem) para uma velocidade em contagens/s (None = sem velocidade ainda)."""
+        p = self.params
+        if isinstance(p, dict):
+            curve, xs = p["curve"], p["xscale"]
+            if not p.get("enabled", True):
+                return xs * curve[-1][1]
+            if not speed:
+                return xs * curve[0][1]
+            mm = speed * xs / COUNTS_PER_MM
+            seg = next((c for c in curve if mm <= c[0]), curve[-1])
+            return xs * (seg[1] + seg[2] / mm)
+        scale, low, high, acc = p
+        speed = speed or 0.0
+        if speed <= low:
+            return scale
+        return scale * (acc if speed >= high else 1 + (speed - low) / (high - low) * (acc - 1))
 
     def gain(self, dx, dy) -> float:
         now = self._clock()
         self._hist.append((now, dx, dy))
         while now - self._hist[0][0] > HORIZON:
             self._hist.popleft()
-        speed = 0.0
+        speed = None
         if len(self._hist) >= 2:
             span = now - self._hist[0][0]
             sx = sum(h[1] for h in list(self._hist)[1:])
             sy = sum(h[2] for h in list(self._hist)[1:])
-            speed = (sx * sx + sy * sy) ** 0.5 / span if span > 0 else float("inf")
-        scale = self.scale
-        if speed > self.low:
-            scale *= self.acc if speed >= self.high else 1 + (speed - self.low) / (self.high - self.low) * (self.acc - 1)
-        return scale
+            speed = (sx * sx + sy * sy) ** 0.5 / span if span > 0 else 1e9
+        return self.speed_gain(speed)
+
+    def fresh(self):
+        return Aceleracao(self.params, self._clock)
 
 
 def trecho(zone, edge, start=0.0, end=1.0):
@@ -159,7 +183,7 @@ class Travessia:
         self._pc_clipboard, self._set_pc_clipboard = pc_clipboard, set_pc_clipboard
         self.on_change, self.on_end, self._clock, self._sleep = on_change, on_end, clock, sleep
         self.start, self.end = start, end
-        self._accel = Aceleracao(getattr(sink, "accel", (1.0, 500.0, 3000.0, 3.0)), clock)
+        self._accel = Aceleracao(getattr(sink, "accel", (1.0, 500.0, 3000.0, 3.0)), clock)  # relido a cada travessia
         self._lock = threading.RLock()
         self.press = None
         self.away = False
@@ -173,7 +197,7 @@ class Travessia:
         self._frac = 0.5
 
     # ── handler da Capture ──
-    def activated(self, point, zones):
+    def activated(self, point, zones, key=None):
         with self._lock:
             self.press = Press(self.edge, point, _zone_at(zones, point), self._clock)
 
@@ -225,6 +249,7 @@ class Travessia:
 
     def _cross(self):
         press, self.press = self.press, None
+        self._accel = Aceleracao(getattr(self.sink, "accel", self._accel.params), self._clock)  # rotação/ajustes mudam
         self._zone = trecho(press.zone, self.edge, self.start, self.end)
         frac = along(self._zone, self.edge, press.point)
         w, h = self.sink.size
@@ -256,9 +281,14 @@ class Travessia:
         dy = self._pos[1] - (0 if top else h - 1)
         sx, sy = (dx > 0) - (dx < 0), (dy > 0) - (dy < 0)
         self.sink.move(sx, sy)
-        g = self._accel.scale * self._accel.acc
-        rx, ry = (dx - sx) / g, (dy - sy) / g
-        n = max(1, int(max(abs(rx), abs(ry)) // STEP_COUNTS) + 1)
+        g0 = self._accel.speed_gain(None)  # primeiro passo: o Android ainda não tem velocidade
+        ex, ey = dx - sx * g0, dy - sy * g0
+        g = self._accel.speed_gain(STEP_COUNTS / STEP_SECONDS)
+        for _ in range(4):  # passos iguais: a velocidade de cada passo decide o ganho (a curva é contínua)
+            rx, ry = ex / g, ey / g
+            n = max(1, int(max(abs(rx), abs(ry)) // STEP_COUNTS) + 1)
+            g = self._accel.speed_gain((rx * rx + ry * ry) ** 0.5 / n / STEP_SECONDS)
+        rx, ry = ex / g, ey / g
         done = [0, 0]
         for i in range(1, n + 1):
             self._sleep(STEP_SECONDS)
@@ -266,7 +296,7 @@ class Travessia:
             self.sink.move(tx - done[0], ty - done[1])
             done = [tx, ty]
         self._sleep(SETTLE_SECONDS)  # o movimento do usuário começa do zero no rastreador do Android
-        self._accel = Aceleracao((self._accel.scale, self._accel.low, self._accel.high, self._accel.acc), self._clock)
+        self._accel = self._accel.fresh()
 
     def remote_home(self, frac):
         """O PC alvo viu o ponteiro empurrar a borda que encara este PC, na fração `frac`."""
@@ -351,3 +381,79 @@ class Travessia:
         self._wheel[1] -= v
         if h or v:
             self.sink.wheel(-v, h)  # libei: dy > 0 desce; HID: roda > 0 sobe
+
+
+class Mux:
+    """Handler da Capture com vários alvos: cada barreira leva ao seu dispositivo (uma Travessia por alvo,
+    cada uma com o seu sink: AndroidInput, PeerSink ou outro com move/button/key/wheel/release_all).
+    Um alvo ativo por vez. `drop(chave)` tira um alvo que caiu sem derrubar os outros."""
+
+    def __init__(self, release, on_end=lambda reason: None, on_unplaced=lambda keys: None):
+        self._release, self.on_end, self.on_unplaced = release, on_end, on_unplaced
+        self._lock = threading.RLock()
+        self.targets = {}
+        self.current = None
+
+    def add(self, key, travessia):
+        with self._lock:
+            self.targets[key] = travessia
+
+    def drop(self, key) -> list:
+        """Tira o alvo (solta tudo nele se era o ativo e devolve a entrada ao PC); devolve as chaves que sobram."""
+        with self._lock:
+            t = self.targets.pop(key, None)
+            if t is not None:
+                t.sink_lost()
+                t.sink.close()
+                if self.current == key:
+                    self.current = None
+                    if t.press is not None:
+                        t._let_go("o dispositivo saiu")
+            return list(self.targets)
+
+    @property
+    def away(self):
+        t = self.targets.get(self.current)
+        return bool(t and t.away)
+
+    def activated(self, point, zones, key=None):
+        with self._lock:
+            t = self.targets.get(key)
+            if t is None:  # barreira de um alvo que já saiu: devolve o ponteiro
+                self._release(point)
+                return
+            self.current = key
+            t.activated(point, zones)
+
+    def _now(self):
+        return self.targets.get(self.current)
+
+    def events(self, evs):
+        with self._lock:
+            t = self._now()
+            if t is not None:
+                t.events(evs)
+
+    def tick(self):
+        with self._lock:
+            t = self._now()
+            if t is not None:
+                t.tick()
+
+    def deactivated(self):
+        with self._lock:
+            t = self._now()
+            if t is not None:
+                t.deactivated()
+
+    def unplaced(self, keys):
+        self.on_unplaced(keys)
+
+    def ended(self, reason):
+        with self._lock:
+            for t in list(self.targets.values()):
+                t.ended(reason)
+            self.targets.clear()
+            self.current = None
+        self.on_end(reason)
+

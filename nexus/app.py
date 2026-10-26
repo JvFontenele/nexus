@@ -88,18 +88,22 @@ def mascot_area(width: int, height: int, expr_fn) -> Gtk.DrawingArea:
     return area
 
 
-def arranjo_editor(name: str, arr: dict | None, on_save) -> Gtk.DrawingArea:
+def arranjo_editor(name: str, arr: dict | None, on_save, screen=None, others=()) -> Gtk.DrawingArea:
     """Editor do arranjo, como em Configurações → Telas: os monitores em retângulos e o dispositivo
     (retrato) arrastável, que encaixa na borda externa mais próxima. Salva ao soltar."""
     from gi.repository import Gdk
     from nexus import arranjo
     model = Gdk.Display.get_default().get_monitors()
     mons = [(g.x, g.y, g.width, g.height) for g in (model.get_item(i).get_geometry() for i in range(model.get_n_items()))]
-    size = arranjo.phone_size(mons)
+    size = arranjo.phone_size(mons, arranjo.aspect_of(screen))  # proporção real da tela, com a rotação atual
+    # os outros dispositivos arranjados: desenhados apagados, e o trecho deles não pode ser usado
+    taken = [(o["edge"], o["monitor"], o["start"], o["end"]) for _n, o, _s in others]
+    ghosts = [r for r in (arranjo.rect_of(o, mons, arranjo.phone_size(mons, arranjo.aspect_of(sc))) for _n, o, sc in others) if r]
     rect = [arranjo.rect_of(arr, mons, size) if arr else None]
-    if rect[0] is None:  # sem arranjo (ou monitor que sumiu): à direita do monitor mais à direita
-        rect[0] = arranjo.snap(mons, (max(m[0] + m[2] for m in mons) + size[0], mons[0][1] + mons[0][3] / 2), size)[1]
-    pad = size[1] * 1.1
+    if rect[0] is None:  # sem arranjo (ou monitor que sumiu): na borda livre mais perto da direita
+        rect[0] = arranjo.snap(mons, (max(m[0] + m[2] for m in mons) + size[0], mons[0][1] + mons[0][3] / 2), size,
+                               taken)[1] or (max(m[0] + m[2] for m in mons), mons[0][1], size[0], size[1])
+    pad = max(size) * 1.1  # o lado maior de qualquer dispositivo (retrato ou paisagem) cabe na margem
     x0, y0 = min(m[0] for m in mons) - pad, min(m[1] for m in mons) - pad
     x1, y1 = max(m[0] + m[2] for m in mons) + pad, max(m[1] + m[3] for m in mons) + pad
     area = Gtk.DrawingArea(content_height=240, hexpand=True)
@@ -127,6 +131,11 @@ def arranjo_editor(name: str, arr: dict | None, on_save) -> Gtk.DrawingArea:
             cr.set_font_size(14)
             cr.move_to(sx + 12, sy + 24)
             cr.show_text(f"Monitor {i + 1}")
+        for gx, gy, gw, gh in ghosts:
+            gsx, gsy = to_screen(gx, gy)
+            rounded(cr, gsx + 1, gsy + 1, gw * view["k"] - 2, gh * view["k"] - 2, 7)
+            cr.set_source_rgba(0.55, 0.60, 0.70, 0.45)
+            cr.fill()
         px, py, pw, ph = rect[0]
         sx, sy = to_screen(px, py)
         rounded(cr, sx + 1, sy + 1, pw * view["k"] - 2, ph * view["k"] - 2, 7)
@@ -157,7 +166,12 @@ def arranjo_editor(name: str, arr: dict | None, on_save) -> Gtk.DrawingArea:
             return
         drag["on"] = False
         px, py, pw, ph = rect[0]
-        new, rect[0] = arranjo.snap(mons, (px + pw / 2, py + ph / 2), size)
+        new, snapped = arranjo.snap(mons, (px + pw / 2, py + ph / 2), size, taken)
+        if new is None:  # nenhuma borda livre: volta para onde estava
+            rect[0] = (drag["start"][0], drag["start"][1], pw, ph)
+            area.queue_draw()
+            return
+        rect[0] = snapped
         area.queue_draw()
         on_save(new)
 
@@ -244,6 +258,7 @@ class Window(Adw.ApplicationWindow):
         self.selected = None
         self.devs, self.actions, self.info = {"devices": [], "connected": []}, [], {}
         self.shown_pairings = set()
+        self.screen_asked = set()
         self.daemon = Daemon(self.on_event, self.on_presence)
 
     # ── estado ───────────────────────────────────────────────────────────
@@ -264,6 +279,8 @@ class Window(Adw.ApplicationWindow):
             self.refresh()
         elif kind in ("device.connected", "device.disconnected", "audio.changed", "file.received"):
             self.refresh()
+        elif kind == "input.screen":
+            self.refresh()  # girou o dispositivo: o editor redesenha na proporção nova
         elif kind == "input.crossed":
             if not ev.get("active") and ev.get("reason"):
                 self.toast(f"Borda desativada: {ev['reason']}")
@@ -406,29 +423,39 @@ class Window(Adw.ApplicationWindow):
         """Travessia pela borda: o arranjo e o botão "Ativar borda"."""
         dev = d["device_id"]
         state = self.devs.get("input") or {}
-        mine = state.get("active") == dev
+        on = bool(state.get("active"))  # a borda vale para todos os dispositivos arranjados
+        included = dev in (state.get("targets") or [])
         card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, css_classes=["nx-card"])
         head = Gtk.Box(spacing=10)
         head.append(Gtk.Label(label="Teclado e mouse pela borda", xalign=0, hexpand=True, css_classes=["nx-h2"]))
-        busy = state.get("active") not in (None, dev)
-        btn = Gtk.Button(label="Desativar borda" if mine else "Ativar borda", sensitive=not busy,
-                         css_classes=["pill"] + ([] if mine else ["suggested-action"]))
+        btn = Gtk.Button(label="Desativar borda" if on else "Ativar borda",
+                         css_classes=["pill"] + ([] if on else ["suggested-action"]))
         btn.connect("clicked", lambda _b: self.daemon.command(
-            {"cmd": "input.release" if mine else "input.start", "device_id": dev},
+            {"cmd": "input.release" if on else "input.start"},
             lambda r: self.toast(r["warning"]) if r.get("warning") else r.get("ok") or self.toast(r.get("error", "falhou"))))
         head.append(btn)
         card.append(head)
-        if mine:
-            where = "no dispositivo agora" if state.get("away") else "no PC; empurre a borda marcada para atravessar"
-            tip = f"Borda ativa: o mouse está {where}. Para voltar, empurre a borda do celular que encara o PC ou aperte o Ctrl direito duas vezes."
+        if on and included:
+            where = "neste dispositivo agora" if state.get("current") == dev and state.get("away") else "no PC"
+            tip = (f"Borda ativa: o mouse está {where}. Para voltar, empurre a borda do dispositivo que encara o PC "
+                   "ou aperte o Ctrl direito duas vezes.")
+        elif on:
+            tip = "A borda está ativa, mas sem este dispositivo (não conectou ou caiu). Desative e ative de novo para incluí-lo."
         else:
-            tip = ("Arraste o dispositivo até a borda de um monitor, no ponto em que ele fica na sua mesa. "
-                   "Depois toque em Ativar borda: o GNOME pede permissão e o mouse passa para o dispositivo ao empurrar essa borda. "
+            tip = ("Arraste o dispositivo até a borda de um monitor, no ponto em que ele fica na sua mesa. Os outros "
+                   "dispositivos aparecem apagados: cada um tem o seu trecho. Ativar borda vale para todos os arranjados; "
+                   "o GNOME pede permissão e o mouse passa para o dispositivo da borda que você empurrar. "
                    "A Janela de controle, acima, é outro modo: controla pelo scrcpy, com o mouse sobre a janela.")
         card.append(Gtk.Label(label=tip, xalign=0, wrap=True, css_classes=["dim-label"]))
         card.append(arranjo_editor(d["name"], d.get("arrangement"), lambda arr: self.daemon.command(
             {"cmd": "input.config", "device_id": dev, **arr},
-            lambda r: self.toast("Posição salva" if r.get("ok") else r.get("error", "falhou")))))
+            lambda r: self.toast("Posição salva" if r.get("ok") else r.get("error", "falhou"))), d.get("screen"),
+            [(o["name"], o["arrangement"], o.get("screen")) for o in self.devs["devices"]
+             if o["device_id"] != dev and o.get("arrangement")]))
+        if not d.get("peer") and dev not in self.screen_asked:  # uma leitura por sessão do app (adb, ~0,5 s)
+            self.screen_asked.add(dev)
+            self.daemon.command({"cmd": "input.screen", "device_id": dev},
+                                lambda r: r.get("screen") != d.get("screen") and self.refresh())
         self.content.append(card)
 
     def render_permissions(self, d: dict) -> Gtk.Widget:

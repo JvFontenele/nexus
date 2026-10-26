@@ -94,8 +94,8 @@ class Recorder:
         self.log = []
         self.done = threading.Event()
 
-    def activated(self, point, zones):
-        self.log.append(("activated", point, zones))
+    def activated(self, point, zones, key=None):
+        self.log.append(("activated", point, zones, key))
 
     def events(self, evs):
         self.log.append(("events", evs))
@@ -123,7 +123,7 @@ def wait_for(cond, timeout=3):
 class TestCapture(unittest.TestCase):
     def test_session_flow(self):
         bus, eis, rec = FakeBus(), [], Recorder()
-        cap = capture.Capture("right", rec, bus_factory=lambda: bus, ei_factory=lambda fd: eis.append(FakeEi(fd)) or eis[-1])
+        cap = capture.Capture([("poco", "right", None)], rec, bus_factory=lambda: bus, ei_factory=lambda fd: eis.append(FakeEi(fd)) or eis[-1])
         cap.start()
         self.assertTrue(wait_for(lambda: any(m == "Enable" for m, _ in bus.calls)))
         barrier = next(a for m, a in bus.calls if m == "SetPointerBarriers")
@@ -135,7 +135,7 @@ class TestCapture(unittest.TestCase):
         eis[0].pending = [("motion", 1, 3.0, 0.0), ("frame", 1, 0)]
         bus.peer.send(b"x")
         self.assertTrue(wait_for(lambda: any(e[0] == "events" for e in rec.log)))
-        self.assertEqual(rec.log[0], ("activated", (1919.0, 500.0), [(0, 0, 1920, 1080)]))
+        self.assertEqual(rec.log[0], ("activated", (1919.0, 500.0), [(0, 0, 1920, 1080)], "poco"))
         self.assertEqual(next(e for e in rec.log if e[0] == "events")[1], [("motion", 1, 3.0, 0.0)])  # frame filtrado
         # sinal de outra sessão é ignorado
         bus.queue.append(("/", capture.INTERFACE, "Deactivated", ("/outra", {})))
@@ -158,13 +158,68 @@ class TestCapture(unittest.TestCase):
                                    "Response", (1, {})))
                 return ()
         rec = Recorder()
-        capture.Capture("left", rec, bus_factory=RefusingBus).start()
+        capture.Capture([("x", "left", None)], rec, bus_factory=RefusingBus).start()
         self.assertTrue(rec.done.wait(3))
         self.assertIn("não liberou", rec.log[-1][1])
 
     def test_bad_edge(self):
         with self.assertRaises(ValueError):
-            capture.Capture("diagonal", Recorder())
+            capture.Capture([("x", "diagonal", None)], Recorder())
+
+
+class TestDoisAlvos(unittest.TestCase):
+    def test_capture_one_barrier_per_target_and_drop(self):
+        class Bus2(FakeBus):
+            def call(self, iface, method, sig, args):
+                if method == "GetZones":
+                    self.calls.append((method, args))
+                    self._respond(args[1]["handle_token"].unpack(),
+                                  {"zones": [(1920, 1080, 0, 0), (1920, 1080, 1920, 0)], "zone_set": 1})
+                    return ()
+                return super().call(iface, method, sig, args)
+        bus, rec = Bus2(), Recorder()
+        mon = (1920, 0, 1920, 1080)
+        cap = capture.Capture([("poco", "right", (mon, 0.0, 0.5)), ("tab", "right", (mon, 0.5, 1.0))], rec,
+                              bus_factory=lambda: bus, ei_factory=lambda fd: FakeEi(fd))
+        cap.start()
+        self.assertTrue(wait_for(lambda: any(m == "Enable" for m, _ in bus.calls)))
+        listed = next(a for m, a in bus.calls if m == "SetPointerBarriers")[2]
+        self.assertEqual([b["position"].unpack() for b in listed], [(3840, 0, 3840, 539), (3840, 540, 3840, 1079)])
+        bus.queue.append(("/", capture.INTERFACE, "Activated",
+                          (bus.handle, {"activation_id": 1, "cursor_position": (3839.0, 800.0), "barrier_id": 2})))
+        self.assertTrue(wait_for(lambda: rec.log and rec.log[0][0] == "activated"))
+        self.assertEqual(rec.log[0][3], "tab")
+        cap.set_regions([("poco", "right", (mon, 0.0, 0.5))])  # o tablet caiu: só a barreira dele sai
+        self.assertTrue(wait_for(lambda: [m for m, _ in bus.calls].count("SetPointerBarriers") == 2))
+        self.assertIn("Disable", [m for m, _ in bus.calls])  # o GNOME exige desabilitar antes
+        self.assertEqual(len([a for m, a in bus.calls if m == "SetPointerBarriers"][-1][2]), 1)
+        cap.stop()
+
+    def test_mux_routes_and_drop(self):
+        clock, released = Clock(), []
+        mux = kvm.Mux(released.append)
+        sinks = {k: FakeSink() for k in ("poco", "tab")}
+        for k, edge in (("poco", "right"), ("tab", "left")):
+            mux.add(k, kvm.Travessia(edge, sinks[k], released.append, clock=clock,
+                                     sleep=lambda s: setattr(clock, "t", clock.t + s)))
+        zones = [(0, 0, 1920, 1080)]
+        mux.activated((0.0, 500.0), zones, "tab")  # bateu na barreira do tablet (esquerda)
+        mux.events([("motion", 1, -50.0, 0.0)])
+        self.assertTrue(mux.targets["tab"].away and mux.away)
+        self.assertFalse(mux.targets["poco"].away)
+        mux.events([("key", 1, 30, True)])
+        self.assertIn(("key", 30, True), sinks["tab"].log)
+        self.assertNotIn(("key", 30, True), sinks["poco"].log)
+        self.assertEqual(mux.drop("tab"), ["poco"])  # o tablet caiu sendo o alvo: solta tudo e devolve
+        self.assertIn(("release_all",), sinks["tab"].log)
+        self.assertIn(("close",), sinks["tab"].log)
+        self.assertEqual(len(released), 1)
+        self.assertIsNone(mux.current)
+        mux.activated((1919.0, 500.0), zones, "tab")  # barreira velha: só devolve o ponteiro
+        self.assertEqual(len(released), 2)
+        mux.activated((1919.0, 500.0), zones, "poco")  # o celular continua funcionando
+        mux.events([("motion", 1, 50.0, 0.0)])
+        self.assertTrue(mux.targets["poco"].away)
 
 
 class TestHid(unittest.TestCase):
@@ -411,6 +466,62 @@ class TestTrecho(unittest.TestCase):
         self.assertEqual(kvm.trecho((0, 0, 1920, 1080), "top", 0.0, 0.5), (0, 0, 960, 1080))
 
 
+TABLET_DUMP = """Input Reader State (Nums of device: 11):
+  Device 34: Nexus mouse
+    EventHub Devices: [ 36 ]
+    Cursor Input Mapper:
+      XScale: 0.750
+      YScale: 0.750
+      Acceleration Curve {maxPointerSpeedMmPerS, baseGain, reciprocal}:
+        {32.002000, 2.041600, 0.000000}
+        {52.830000, 3.065600, -32.802560}
+        {119.124000, 4.659200, -116.951680}
+        {inf, 9.625600, -708.835840}
+  Device 6: sec_touchscreen
+      Viewport INTERNAL: displayId=0, uniqueId=local:1, port=123, orientation=%d, densityDpi=240 xDpi=228.0 yDpi=228.2, logicalFrame=[0, 0, %d, %d], physicalFrame=[0, 0, %d, %d], deviceSize=[%d, %d], isActive=[1]
+"""
+
+
+class TestRotacaoETablet(unittest.TestCase):
+    def test_screen_uses_rotated_logical_size(self):
+        # wm size diz 1320x2112 (natural, retrato); em paisagem o viewport traz 2112x1320
+        for orient, w, h in ((1, 2112, 1320), (3, 2112, 1320), (0, 1320, 2112)):
+            dump = TABLET_DUMP % (orient, w, h, w, h, w, h)
+            self.assertEqual(ai.parse_screen(dump), (w, h))
+        self.assertIsNone(ai.parse_screen("nada"))
+
+    def test_one_ui_curve_parsed_and_gain(self):
+        acc = ai.parse_accel(TABLET_DUMP % (1, 2112, 1320, 2112, 1320, 2112, 1320))
+        self.assertEqual(acc["xscale"], 0.75)
+        self.assertEqual(acc["curve"][-1][0], float("inf"))
+        m = kvm.Aceleracao(acc)
+        self.assertAlmostEqual(m.speed_gain(None), 0.75 * 2.0416)  # sem velocidade: primeiro trecho
+        mm = 15000 * 0.75 / kvm.COUNTS_PER_MM
+        self.assertAlmostEqual(m.speed_gain(15000), 0.75 * (9.6256 - 708.83584 / mm))
+        self.assertGreater(m.speed_gain(15000), m.speed_gain(1000))
+
+    def test_landscape_tablet_does_not_return_early(self):
+        clock, sink = Clock(), FakeSink()
+        sink.size = (2112, 1320)  # paisagem
+        t = kvm.Travessia("right", sink, lambda p: None, clock=clock, sleep=lambda s: setattr(clock, "t", clock.t + s))
+        t.activated((1919.0, 540.0), [(0, 0, 1920, 1080)])
+        t.events([("motion", 1, 50.0, 0.0)])
+        self.assertTrue(t.away)
+        for _ in range(15):  # 1500 px para a direita: passa de x=1320 sem voltar ao PC
+            clock.t += 0.2
+            t.events([("motion", 1, 100.0, 0.0)])
+        self.assertTrue(t.away)
+        self.assertGreater(t._pos[0], 1320)
+
+    def test_rotation_seen_at_next_crossing(self):
+        clock, sink = Clock(), FakeSink()
+        t = kvm.Travessia("right", sink, lambda p: None, clock=clock, sleep=lambda s: setattr(clock, "t", clock.t + s))
+        sink.size = (2112, 1320)  # girou antes de atravessar
+        t.activated((1919.0, 1079.0), [(0, 0, 1920, 1080)])
+        t.events([("motion", 1, 50.0, 0.0)])
+        self.assertAlmostEqual(t._pos[1], 1319, delta=1)  # fundo da tela em paisagem, não 1999
+
+
 class TestArranjo(unittest.TestCase):
     MONS = [(0, 0, 1920, 1080), (1920, 0, 1920, 1080)]
 
@@ -434,6 +545,24 @@ class TestArranjo(unittest.TestCase):
         arr, _ = arranjo.snap(self.MONS, (3900, 5000), size)  # muito abaixo: preso no fim da borda
         self.assertTrue(arr["end"] <= 1.0 and arr["start"] >= 0.0)
         self.assertIsNone(arranjo.rect_of({**arr, "monitor": [9, 9, 9, 9]}, self.MONS, size))
+
+    def test_snap_avoids_other_devices(self):
+        from nexus import arranjo
+        size = arranjo.phone_size(self.MONS)
+        taken = [("right", [1920, 0, 1920, 1080], 0.0, 0.6)]  # o celular já ocupa o alto da borda direita
+        arr, _ = arranjo.snap(self.MONS, (3900, 300), size, taken)
+        self.assertFalse(arr["edge"] == "right" and arr["monitor"] == [1920, 0, 1920, 1080] and arr["start"] < 0.6)
+        full = [(e, list(m), 0.0, 1.0) for m in self.MONS for e in ("left", "right", "top", "bottom")]
+        self.assertEqual(arranjo.snap(self.MONS, (3900, 300), size, full), (None, None))
+
+    def test_aspect(self):
+        from nexus import arranjo
+        w, h = arranjo.phone_size(self.MONS, arranjo.aspect_of([2112, 1320]))  # tablet em paisagem
+        self.assertGreater(w, h)
+        self.assertAlmostEqual(w / h, 2112 / 1320)
+        w, h = arranjo.phone_size(self.MONS, arranjo.aspect_of(None))  # sem dado: celular em retrato
+        self.assertLess(w, h)
+        self.assertEqual(arranjo.aspect_of([0, 5]), arranjo.PHONE_ASPECT)
 
 
 if __name__ == "__main__":

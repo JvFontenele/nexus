@@ -358,9 +358,9 @@ class TestDaemon(unittest.TestCase):
         cmd = lambda **req: self.call(self.d._control_cmd(req))
         dev = self.fp_phone
         good = dict(cmd="input.config", device_id=dev, edge="right", monitor=[1920, 0, 1920, 1080], start=0.2, end=0.7)
-        self.assertEqual(cmd(cmd="input.start", device_id=dev)["error"], "controle não liberado para este dispositivo")
+        self.assertIn("posicione", cmd(cmd="input.start")["error"])  # sem permissão nem arranjo: nenhum alvo
         self.assertTrue(cmd(cmd="devices.allow", device_id=dev, action="input.control")["ok"])
-        self.assertIn("posicione", cmd(cmd="input.start", device_id=dev)["error"])
+        self.assertIn("posicione", cmd(cmd="input.start")["error"])
         for bad in ({"edge": "meio"}, {"monitor": [0, 0, 0, 10]}, {"monitor": "x"}, {"start": 0.7, "end": 0.2},
                     {"end": 1.5}, {"start": True}, {"monitor": [0, 0, 10**9, 10]}):
             self.assertFalse(cmd(**{**good, **bad})["ok"], bad)
@@ -372,19 +372,59 @@ class TestDaemon(unittest.TestCase):
                 mock.patch("nexus.android_input.AndroidInput", return_value=sink) as mk_sink, \
                 mock.patch("nexus.capture.Capture", return_value=cap) as mk_cap:
             sink.autoclick_on.return_value = True
-            started = cmd(cmd="input.start", device_id=dev)
+            started = cmd(cmd="input.start")
             self.assertTrue(started["ok"])
             self.assertIn("clique automático", started["warning"])  # avisa, mas não bloqueia
-            self.assertEqual(cmd(cmd="input.start", device_id=dev)["error"], "a borda já está ativa")
+            self.assertEqual(cmd(cmd="input.start")["error"], "a borda já está ativa")
         mk_sink.assert_called_once()
-        self.assertEqual(mk_cap.call_args.kwargs["region"], ((1920, 0, 1920, 1080), 0.2, 0.7))
+        self.assertEqual(mk_cap.call_args[0][0], [(dev, "right", ((1920, 0, 1920, 1080), 0.2, 0.7))])
         cap.start.assert_called_once()
-        self.assertEqual(cmd(cmd="input.status")["active"], dev)
-        # desligar a permissão encerra a borda
+        self.assertEqual(cmd(cmd="input.status")["targets"], [dev])
+        self.assertEqual(next(d for d in cmd(cmd="devices.list")["devices"] if d["device_id"] == dev)["screen"], [1080, 2400])
+        # desligar a permissão tira o alvo; sem alvos, a sessão acaba
         self.assertTrue(cmd(cmd="devices.deny", device_id=dev, action="input.control")["ok"])
+        for _ in range(100):
+            if cap.stop.called:
+                break
+            time.sleep(0.02)
         cap.stop.assert_called_once()
+        sink.close.assert_called()
         self.d._input_ended(self.d.kvm, None)
-        self.assertIsNone(cmd(cmd="input.status")["active"])
+        self.assertFalse(cmd(cmd="input.status")["active"])
+
+    def test_two_targets_and_one_drops(self):
+        from unittest import mock
+        self.pair()
+        self.pair(self.tablet)
+        cmd = lambda **req: self.call(self.d._control_cmd(req))
+        tab = device_id(self.tablet[0])
+        mon = [1920, 0, 1920, 1080]
+        for dev, (a, b) in ((self.fp_phone, (0.0, 0.5)), (tab, (0.5, 1.0))):
+            self.assertTrue(cmd(cmd="devices.allow", device_id=dev, action="input.control")["ok"])
+            self.assertTrue(cmd(cmd="input.config", device_id=dev, edge="right", monitor=mon, start=a, end=b)["ok"])
+        over = cmd(cmd="input.config", device_id=tab, edge="right", monitor=mon, start=0.3, end=0.8)
+        self.assertIn("já é do", over["error"])  # trechos não se sobrepõem
+        sinks = {}
+
+        def make_sink(serial, on_lost, on_rotate):
+            s = mock.MagicMock(accel=(1.0, 500.0, 3000.0, 3.0), size=(1080, 2400))
+            s.autoclick_on.return_value = False
+            sinks[serial] = (s, on_lost)
+            return s
+        cap = mock.MagicMock()
+        with mock.patch("nexus.actions.desktop._adb_device", side_effect=lambda name, ip: ("S%d" % (len(sinks) + 1), None)), \
+                mock.patch("nexus.android_input.AndroidInput", side_effect=make_sink), \
+                mock.patch("nexus.capture.Capture", return_value=cap) as mk_cap:
+            self.assertTrue(cmd(cmd="input.start")["ok"])
+        self.assertEqual(len(mk_cap.call_args[0][0]), 2)  # uma barreira por alvo, na mesma sessão
+        self.assertEqual(sorted(cmd(cmd="input.status")["targets"]), sorted([self.fp_phone, tab]))
+        s2, lost2 = sinks["S2"]
+        lost2()  # o segundo aparelho caiu
+        self.assertEqual(len(cmd(cmd="input.status")["targets"]), 1)
+        self.assertEqual(len(cap.set_regions.call_args[0][0]), 1)  # só a barreira dele saiu
+        cap.stop.assert_not_called()  # os outros continuam
+        self.assertTrue(cmd(cmd="input.release")["ok"])
+        cap.stop.assert_called_once()
 
     def test_audio_stream(self):
         import struct as st

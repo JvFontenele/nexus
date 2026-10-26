@@ -202,11 +202,13 @@ def barriers(zones, edge, region=None) -> list:
 # ── a sessão ────────────────────────────────────────────────────────────
 
 class Capture:
-    def __init__(self, edge: str, handler, region=None, bus_factory=GioBus, ei_factory=eiread.Context,
-                 clock=time.monotonic):
-        if edge not in EDGES:
+    def __init__(self, regions, handler, bus_factory=GioBus, ei_factory=eiread.Context, clock=time.monotonic):
+        """`regions` = [(chave, borda, região ou None)]: uma barreira (ou mais) por alvo; o Activated diz a chave."""
+        if not regions or any(edge not in EDGES for _k, edge, _r in regions):
             raise ValueError("borda inválida")
-        self.edge, self.region = edge, region
+        self.regions = list(regions)
+        self._ids = {}       # barrier_id → chave do alvo
+        self._enabled = False
         self.handler = handler
         self._bus_factory = bus_factory
         self._ei_factory = ei_factory
@@ -224,6 +226,11 @@ class Capture:
     def release(self, point):
         """Devolve o ponteiro ao PC em `point` (qualquer thread)."""
         self._jobs.put(("release", (float(point[0]), float(point[1]))))
+        self._wake()
+
+    def set_regions(self, regions):
+        """Troca as barreiras (qualquer thread): ex. um alvo caiu e só a barreira dele sai."""
+        self._jobs.put(("regions", list(regions)))
         self._wake()
 
     def _wake(self):
@@ -283,15 +290,46 @@ class Capture:
         results = self.portal.request("GetZones", "oa{sv}", lambda t: (self.handle, {"handle_token": v("s", t)}),
                                       REQUEST_SECONDS)
         self.zones = [(x, y, w, h) for w, h, x, y in results.get("zones", [])]
-        positions = barriers(self.zones, self.edge, self.region)
-        if not positions:
-            raise PortalError("esse trecho da borda encosta em outro monitor: escolha uma borda livre")
-        listed = [{"barrier_id": v("u", i + 1), "position": v("(iiii)", p)} for i, p in enumerate(positions)]
+        self._ids, listed, unplaced = {}, [], []
+        for key, edge, region in self.regions:
+            try:
+                positions = barriers(self.zones, edge, region)
+            except PortalError:
+                positions = []
+            if not positions:
+                unplaced.append(key)  # monitor sumiu ou o trecho encosta em outro monitor
+            for p in positions:
+                self._ids[len(listed) + 1] = key
+                listed.append({"barrier_id": v("u", len(listed) + 1), "position": v("(iiii)", p)})
+        if self._enabled:  # o GNOME recusa barreiras numa sessão habilitada
+            self.portal.bus.call(INTERFACE, "Disable", "oa{sv}", (self.handle, {}))
+            self._enabled = False
         res = self.portal.request("SetPointerBarriers", "oa{sv}aa{sv}u", lambda t: (
             self.handle, {"handle_token": v("s", t)}, listed, results.get("zone_set", 0)), REQUEST_SECONDS)
-        if len(res.get("failed_barriers", [])) == len(positions):
-            raise PortalError("o GNOME recusou as barreiras")
+        failed = set(res.get("failed_barriers", []))
+        placed = {k for i, k in self._ids.items() if i not in failed}
+        unplaced += [k for k in dict.fromkeys(self._ids.values()) if k not in placed]
+        if not placed:
+            raise PortalError("nenhuma barreira coube: escolha bordas livres no editor")
+        if unplaced and hasattr(self.handler, "unplaced"):
+            self.handler.unplaced(unplaced)
         self.portal.bus.call(INTERFACE, "Enable", "oa{sv}", (self.handle, {}))
+        self._enabled = True
+
+    def _key_at(self, point):
+        """Alvo da barreira mais perto do ponto (Activated sem barrier_id)."""
+        best = None
+        for key, edge, region in self.regions:
+            try:
+                segs = barriers(self.zones, edge, region)
+            except PortalError:
+                continue
+            for x1, y1, x2, y2 in segs:  # segmento horizontal ou vertical
+                cx, cy = min(max(point[0], x1), x2), min(max(point[1], y1), y2)
+                d = abs(point[0] - cx) + abs(point[1] - cy)
+                if best is None or d < best[0]:
+                    best = (d, key)
+        return best[1] if best else None
 
     def _loop(self, ei):
         activation, early, early_at, disabled_at = None, [], 0.0, None
@@ -306,7 +344,9 @@ class Capture:
                 if member == "Activated":
                     activation = opts.get("activation_id", NO_ID)
                     point = opts.get("cursor_position") or (0.0, 0.0)
-                    self.handler.activated((float(point[0]), float(point[1])), self.zones)
+                    point = (float(point[0]), float(point[1]))
+                    key = self._ids.get(opts.get("barrier_id")) or self._key_at(point)
+                    self.handler.activated(point, self.zones, key)
                     if early and self._clock() - early_at < EARLY_SECONDS:
                         self.handler.events(early)
                     early = []
@@ -316,14 +356,22 @@ class Capture:
                     activation = None
                     if member == "Disabled":
                         disabled_at = self._clock()
+                        self._enabled = False
                 elif member == "ZonesChanged":
                     disabled_at = self._clock()  # o mutter desabilita a sessão ao mudar de monitor
+                    self._enabled = False
             if disabled_at is not None and self._clock() - disabled_at >= DISABLED_SECONDS:
                 disabled_at = None
                 self._set_barriers()
             while not self._jobs.empty():
                 kind, point = self._jobs.get()
-                if kind == "release":
+                if kind == "regions":
+                    self.regions = point
+                    if activation is not None:  # a entrada está fora: devolve antes de trocar as barreiras
+                        self.portal.bus.call(INTERFACE, "Release", "oa{sv}", (self.handle, {}))
+                        activation = None
+                    self._set_barriers()
+                elif kind == "release":
                     opts = {"cursor_position": v("(dd)", point)}
                     if activation not in (None, NO_ID):
                         opts["activation_id"] = v("u", activation)

@@ -98,6 +98,8 @@ class MainActivity : ComponentActivity() {
     private var autoclique by mutableStateOf(false)
     private var bateriaLivre by mutableStateOf(true)
     private var guia by mutableStateOf(false)
+    private var tecladoBt by mutableStateOf(false)
+    private var layoutEscolhido by mutableStateOf(false)
 
     private val kind get() = if (resources.configuration.smallestScreenWidthDp >= 600) "tablet" else "phone"
     private val name get() = Build.MODEL
@@ -108,6 +110,7 @@ class MainActivity : ComponentActivity() {
         pin = prefs.getString("pin", null)
         pcName = prefs.getString("pc_name", null) ?: "PC"
         linked = prefs.getBoolean("link", false)
+        layoutEscolhido = prefs.getBoolean("layout_teclado_ok", false)
         val tema = darkColorScheme(primary = Cores.acento, onPrimary = Cores.acentoEscuro, background = Cores.fundo,
             surface = Cores.fundo, onSurface = Cores.texto, onBackground = Cores.texto)
         setContent { MaterialTheme(colorScheme = tema) { Surface(Modifier.fillMaxSize(), color = Cores.fundo) { Tela() } } }
@@ -270,11 +273,14 @@ class MainActivity : ComponentActivity() {
         DisposableEffect(Unit) { // teclado/mouse do PC: UHID aparece e some com a borda
             val im = getSystemService(InputManager::class.java)
             val l = object : InputManager.InputDeviceListener {
-                override fun onInputDeviceAdded(id: Int) { controlado = LinkService.pcControlando(this@MainActivity) }
+                override fun onInputDeviceAdded(id: Int) {
+                    controlado = LinkService.pcControlando(this@MainActivity)
+                    tecladoBt = LinkService.tecladoBluetooth(this@MainActivity)
+                }
                 override fun onInputDeviceRemoved(id: Int) = onInputDeviceAdded(id)
                 override fun onInputDeviceChanged(id: Int) = onInputDeviceAdded(id)
             }
-            controlado = LinkService.pcControlando(this@MainActivity)
+            l.onInputDeviceAdded(0)
             im.registerInputDeviceListener(l, null)
             onDispose { im.unregisterInputDeviceListener(l) }
         }
@@ -392,6 +398,7 @@ class MainActivity : ComponentActivity() {
 
             Aparece(linked && guia) { Cartao { ManterLigado() } }
             Aparece(controlado) { Cartao { Controle() } }
+            Aparece(tecladoBt && !layoutEscolhido) { Cartao { LayoutTeclado() } }
             FileTransfer.ativas.forEach { t -> key(t.id) { Cartao { Transferindo(t) } } }
 
             Aparece(settings) { Cartao {
@@ -443,6 +450,23 @@ class MainActivity : ComponentActivity() {
                     color = Cores.laranja, fontSize = 14.sp)
                 OutlinedButton({ abrir(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) },
                     border = BorderStroke(1.5.dp, Cores.borda)) { Text("Abrir Acessibilidade") }
+            }
+        }
+    }
+
+    // shortcut: não há API pública para ler o layout escolhido de um teclado físico; o "Já escolhi" fica salvo
+    @Composable
+    private fun LayoutTeclado() {
+        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("Escolha Português (Brasil) para o teclado Nexus", fontWeight = FontWeight.Bold, fontSize = 15.sp)
+            Text("Sem isso, o Android usa o inglês (EUA) e o ç e alguns símbolos saem errados.",
+                color = Cores.apagado, fontSize = 13.sp)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button({ abrir(Intent(Settings.ACTION_HARD_KEYBOARD_SETTINGS), Intent(Settings.ACTION_INPUT_METHOD_SETTINGS)) }) {
+                    Text("Abrir teclado físico")
+                }
+                OutlinedButton({ layoutEscolhido = true; prefs.edit().putBoolean("layout_teclado_ok", true).apply() },
+                    border = BorderStroke(1.5.dp, Cores.borda)) { Text("Já escolhi") }
             }
         }
     }

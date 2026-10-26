@@ -87,6 +87,7 @@ class PeerSink:
     """Conexão de entrada com o PC alvo. `on_lost(motivo)` e `on_home(fração)` vêm de outra thread."""
     exact = True  # o alvo sabe a posição real (ponteiro absoluto): ele decide a volta e manda HOME
     size = (1, 1)
+    zones = []
     accel = (1.0, 1.0, 2.0, 1.0)
 
     def __init__(self, record, cert, key, on_lost=lambda reason: None, on_home=lambda frac: None,
@@ -108,7 +109,7 @@ class PeerSink:
         ch = _Channel(self.sock)
         self.sock.settimeout(READY_SECONDS)
         ch.send("input.attach", {})
-        ch.recv("input.ready")
+        self.zones = ch.recv("input.ready")["zones"]
         self.sock.settimeout(None)
         self._recv = ch._recv
         self._last_in = self._clock()
