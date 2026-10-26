@@ -36,6 +36,8 @@ INPUT_INJECT = "input.inject"  # este PC aceita ser controlado por aquele PC (pa
 INPUT_DEAD = 2.5  # s sem frame do controlador: solta tudo e encerra
 SENT_HOME = 5.0   # s em que um PC mandado para casa não pode voltar
 HOST_RE = __import__("re").compile(r"[A-Za-z0-9.:-]{1,253}")
+AGENT_TIMEOUT = 110  # s: pedido de permissão do Claude Code sem clique expira (o terminal pergunta)
+MAX_AGENT_REQUESTS = 20
 AUTOCLICK_WARNING = ("O clique automático do Android está ligado: o celular vai clicar sozinho quando o ponteiro parar. "
                      "Desligue em Acessibilidade.")
 
@@ -137,6 +139,9 @@ class Daemon:
         self.sent_home: dict[str, tuple[float, int]] = {}  # device_id → (prazo monotônico, sessão de posse)
         self.peers = TrustStore(data / "peers.json")  # PCs que este controla (certificado pinado)
         self.peer_pairings: dict[str, tuple] = {}
+        self.agent_requests: dict[str, dict] = {}  # id → {"info", "fut"}: pedidos de permissão do Claude Code
+        self.agent_timeout = AGENT_TIMEOUT
+        self.agent_ui = False  # o notch com o cartão de aprovação já se anunciou (agent.pending)
         from nexus import inject
         tokens = inject.TokenStore(data / "remote-desktop.token")
         self.injector_factory = lambda on_lost: inject.RemoteDesktop(tokens, on_lost)
@@ -855,7 +860,18 @@ class Daemon:
             if uid != os.getuid():
                 return
             req = framing.decode_payload(await reader.readexactly(framing.frame_length(await reader.readexactly(4))))
-            writer.write(framing.encode(await self._control_cmd(req)))
+            if req.get("cmd") == "agent.request":
+                # o hook pode ser morto (o usuário respondeu no terminal): EOF cancela o pedido e tira o cartão do notch
+                cmd, eof = asyncio.ensure_future(self._control_cmd(req)), asyncio.ensure_future(reader.read(1))
+                await asyncio.wait({cmd, eof}, return_when=asyncio.FIRST_COMPLETED)
+                eof.cancel()
+                if not cmd.done():
+                    cmd.cancel()
+                    return
+                resp = cmd.result()
+            else:
+                resp = await self._control_cmd(req)
+            writer.write(framing.encode(resp))
             await writer.drain()
         except (framing.FrameError, asyncio.IncompleteReadError, ConnectionError):
             pass
@@ -959,11 +975,60 @@ class Daemon:
                 from nexus import kvmwire
                 await self._bye(self.owner, kvmwire.BYE_NOT_ALLOWED)
             return {"ok": True}
+        if cmd == "agent.request":
+            return await self._agent_request(req)
+        if cmd == "agent.decide":
+            return self._agent_decide(req)
+        if cmd == "agent.pending":
+            self.agent_ui = True  # só o Balão novo chama: o antigo não mostraria o cartão e o hook esperaria à toa
+            return {"ok": True, "requests": [{"id": i, **a["info"]} for i, a in self.agent_requests.items()]}
         if cmd == "actions":
             return {"ok": True, "actions": _phone_actions()}
         if cmd == "status":
             return {"ok": True, "device_id": self.fp_s, "listen": self.listen, "port": self.port}
         return {"ok": False, "error": "comando desconhecido"}
+
+
+    # ── permissões do Claude Code (hook PermissionRequest; nexus/agentes.py) ──
+    async def _agent_request(self, req: dict) -> dict:
+        """Mostra o pedido no notch e espera o clique. Nunca executa nada: só devolve a decisão ao hook."""
+        from nexus import agentes
+        if not self.shell_present():
+            self.agent_ui = False
+        if not self.agent_ui:
+            return {"ok": False, "error": "notch ausente"}  # o terminal pergunta
+        if len(self.agent_requests) >= MAX_AGENT_REQUESTS:
+            return {"ok": False, "error": "muitos pedidos"}
+        try:
+            info = agentes.validar(req)
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+        rid = new_offer_id()
+        fut = asyncio.get_running_loop().create_future()
+        self.agent_requests[rid] = {"info": info, "fut": fut}
+        self.emit({"event": "agent.request", "id": rid, **info})
+        decision = None
+        try:
+            decision = await asyncio.wait_for(fut, self.agent_timeout)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            self.agent_requests.pop(rid, None)
+            self.emit({"event": "agent.closed", "id": rid})
+            # só metadados: nunca o comando nem o caminho
+            log_event({"event": "agent.decision", "tool": info["tool"], "decision": decision or "none"})
+        return {"ok": True, "decision": None if decision == "terminal" else decision}
+
+    def _agent_decide(self, req: dict) -> dict:
+        from nexus import agentes
+        a = self.agent_requests.get(str(req.get("id")))
+        decision = req.get("decision")
+        if a is None or a["fut"].done():
+            return {"ok": False, "error": "pedido não encontrado"}
+        if decision not in agentes.DECISIONS or (decision == "always" and not a["info"]["always"]):
+            return {"ok": False, "error": "decisão inválida"}
+        a["fut"].set_result(decision)
+        return {"ok": True}
 
 
 def check_arrangement(req: dict) -> dict:

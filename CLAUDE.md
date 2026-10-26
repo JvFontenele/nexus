@@ -29,6 +29,7 @@ Repositórios de referência (Beamer, Coucou, Zorin Connect) e o commit estudado
   - **Execução:** roda como `systemctl --user` (`packaging/`). O IP é lido na partida; ao trocar de rede, rode `systemctl --user restart nexusd`.
 - **Identidade e pareamento:** `nexus/proto/` (identity, pairing SAS commit/reveal, trust, framing, messages). Dados ficam em `~/.local/share/nexus/` e log em `~/.local/state/nexus/events.jsonl` (só chaves, nunca conteúdo).
 - **Áudio** (`nexus/audio.py`, ADR-0004): saída virtual `nexus-audio` vira a padrão, `pw-cat` captura, PCM 48 kHz vai por TLS, e o celular toca no AudioTrack. A saída anterior sempre é restaurada.
+- **Claude Code** (`nexus/agentes.py`): hook `PermissionRequest` (`python3 -P …/nexus/agentes.py hook`) → `agent.request` no socket de controle → cartão no notch (Negar/Permitir/Sempre/No terminal) → decisão volta ao hook. Qualquer falha = sem decisão (o terminal pergunta); nunca aprova sozinho.
 - **Arquivos** (`nexus/files.py`): `~/Downloads/Nexus`; PC → celular por `file.offer`/`file.pull` (uso único). Progresso em `file.progress`/`file.done`, cancelamento por `file.cancel`.
 - **Espelhar:** `scrcpy` com argumentos fixos. O dispositivo é casado pelo `model:` do `adb devices -l` (com `-` virando `_`); o adb sem fio é reconectado pelo Avahi `_adb-tls-connect`, só para o IP do dispositivo conectado.
 - **Frontends:**
@@ -38,8 +39,8 @@ Repositórios de referência (Beamer, Coucou, Zorin Connect) e o commit estudado
 
 ## Rodar, testar e compilar
 ```bash
-python3 -m unittest discover -s tests                       # 104 testes (inclui TLS real e D-Bus em barramento privado)
-cd ../pesquisa-linux && tests/aninhado.sh                   # 33 testes do Balão num GNOME Shell aninhado (abre uma janela)
+python3 -m unittest discover -s tests                       # 160 testes (inclui TLS real e D-Bus em barramento privado)
+cd ../pesquisa-linux && tests/aninhado.sh                   # 36 testes do Balão num GNOME Shell aninhado (abre uma janela)
 cd android && JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 ~/.local/opt/gradle-9.8.2/bin/gradle -q assembleDebug
 adb install -r android/app/build/outputs/apk/debug/app-debug.apk
 systemctl --user restart nexusd                             # depois de mudar código Python
@@ -59,6 +60,7 @@ systemctl --user restart nexusd                             # depois de mudar c�
 - **Tailscale do PC:** `100.77.106.53`. No celular, o Tailscale não respondia no último teste.
 
 ## Pendências e próximas etapas (em ordem)
+0. **Aprovar o Claude Code pelo notch (Fase B, pronta, sem instalar):** `nexus agents install [--config-dir DIR]` mostra o diff do hook `PermissionRequest` no `settings.json` e só grava com `--yes` (backup `settings.json.bak-AAAAMMDD-HHMMSS`). Instalar em `~/.claude` e `~/.claude-pessoal` só com o usuário. Depois: validar com uma sessão real; **Fase C** = aprovar pelo celular (mensagem nova no protocolo, permissão por dispositivo desligada por padrão); AskUserQuestion fora por ora.
 1. **Tablet:** parear na mesma rede e validar multidispositivo (áudio, arquivo e espelhamento para o dispositivo certo; o seletor de alvo no notch).
 2. **Android no boot:** `BOOT_COMPLETED` + guia de "Sem restrições" de bateria/autostart no HyperOS/One UI. Validar após bloqueio, remoção dos recentes e reinício.
 3. **Testes longos (#011/#012):** áudio por 30–60 min, queda de Wi-Fi no meio, bloquear/desbloquear o celular, latência pela tailnet (Opus só se precisar).

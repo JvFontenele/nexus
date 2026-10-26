@@ -58,7 +58,19 @@ def main(argv=None):
     al.add_argument("device_id")
     al.add_argument("action")
 
+    ag = sub.add_parser("agents", help="aprovar permissões do Claude Code pelo notch").add_subparsers(
+        dest="agents_cmd", required=True)
+    ai = ag.add_parser("install", help="mostra o diff do hook PermissionRequest no settings.json; --yes grava")
+    ai.add_argument("--config-dir", help="diretório do Claude Code (padrão: $CLAUDE_CONFIG_DIR ou ~/.claude)")
+    ai.add_argument("--yes", action="store_true", help="gravar (com backup settings.json.bak-AAAAMMDD-HHMMSS)")
+
     args = parser.parse_args(argv)
+    if args.command == "agents":
+        import os
+        from pathlib import Path
+        from nexus import agentes
+        pasta = args.config_dir or os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude"
+        return agentes.instalar(Path(pasta).expanduser(), args.yes)
 
     if args.command == "actions":
         return _cmd_actions(args)
