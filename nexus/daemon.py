@@ -635,16 +635,28 @@ class Daemon:
         return None, None
 
     def _arranged(self) -> list:
-        """(store, registro) de todos os alvos com arranjo e permissão: entram na borda."""
+        """(store, registro) de todos os alvos com arranjo, permissão e "Usar na borda" ligado: entram na borda."""
         out = [(self.store, r) for r in self.store.records.values()
-               if r.get("arrangement") and INPUT_CONTROL in r["permissions"]]
-        return out + [(self.peers, r) for r in self.peers.records.values() if r.get("arrangement")]
+               if r.get("arrangement") and INPUT_CONTROL in r["permissions"] and r.get("edge_on", True)]
+        return out + [(self.peers, r) for r in self.peers.records.values()
+                      if r.get("arrangement") and r.get("edge_on", True)]
 
     def _input_config(self, req: dict) -> dict:
         dev_id = str(req.get("device_id"))
         store, rec = self._target(dev_id)
         if rec is None:
             return {"ok": False, "error": "dispositivo não pareado"}
+        if "enabled" in req:  # "Usar na borda": desligado, fica de fora (com a borda ativa, sai ou entra já)
+            on = req["enabled"] is True
+            store.update(dev_id, "edge_on", on)
+            k = self.kvm
+            if k and "mux" in k:
+                if not on and dev_id in k["mux"].targets:
+                    self._target_lost(k, dev_id, "tirado da borda")
+                elif on and (store is self.peers or INPUT_CONTROL in rec["permissions"]):
+                    asyncio.ensure_future(self._target_back(k, dev_id))
+            if "edge" not in req and "transport" not in req:
+                return {"ok": True}
         if "transport" in req:
             t = req["transport"]
             if t not in TRANSPORTS or store is not self.store:
@@ -1066,11 +1078,12 @@ class Daemon:
         if cmd == "devices.list":
             return {"ok": True, "devices": [{**{k: r[k] for k in ("device_id", "name", "kind", "paired_at", "permissions")},
                                              "arrangement": r.get("arrangement"), "screen": r.get("screen"),
-                                             "transport": r.get("transport", "adb"), "bt_address": r.get("bt_address")}
+                                             "transport": r.get("transport", "adb"), "bt_address": r.get("bt_address"),
+                                             "edge_on": r.get("edge_on", True)}
                                             for r in self.store.records.values()]
                                + [{"device_id": r["device_id"], "name": r["name"], "kind": "pc", "paired_at": r["paired_at"],
                                    "permissions": [INPUT_CONTROL], "arrangement": r.get("arrangement"),
-                                   "screen": r.get("screen"), "peer": True}
+                                   "screen": r.get("screen"), "peer": True, "edge_on": r.get("edge_on", True)}
                                   for r in self.peers.records.values()],
                     "input": self._input_status(),
                     "connected": sorted(self.by_device),

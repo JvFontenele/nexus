@@ -381,6 +381,22 @@ class TestDaemon(unittest.TestCase):
         cap.start.assert_called_once()
         self.assertEqual(cmd(cmd="input.status")["targets"], [dev])
         self.assertEqual(next(d for d in cmd(cmd="devices.list")["devices"] if d["device_id"] == dev)["screen"], [1080, 2400])
+        # "Usar na borda" desligado: sai na hora e fica de fora do próximo input.start
+        self.assertTrue(cmd(cmd="input.config", device_id=dev, enabled=False)["ok"])
+        for _ in range(100):
+            if cap.stop.called:
+                break
+            time.sleep(0.02)
+        cap.stop.assert_called_once()
+        self.d._input_ended(self.d.kvm, None)
+        self.assertFalse(next(d for d in cmd(cmd="devices.list")["devices"] if d["device_id"] == dev)["edge_on"])
+        self.assertIn("posicione", cmd(cmd="input.start")["error"])
+        self.assertTrue(cmd(cmd="input.config", device_id=dev, enabled=True)["ok"])
+        with mock.patch("nexus.actions.desktop._adb_device", return_value=("7db4da6e", None)), \
+                mock.patch("nexus.android_input.AndroidInput", return_value=sink), \
+                mock.patch("nexus.capture.Capture", return_value=cap):
+            cap.reset_mock()
+            self.assertTrue(cmd(cmd="input.start")["ok"])
         # desligar a permissão tira o alvo; sem alvos, a sessão acaba
         self.assertTrue(cmd(cmd="devices.deny", device_id=dev, action="input.control")["ok"])
         for _ in range(100):

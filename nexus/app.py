@@ -435,6 +435,14 @@ class Window(Adw.ApplicationWindow):
         card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, css_classes=["nx-card"])
         head = Gtk.Box(spacing=10)
         head.append(Gtk.Label(label="Teclado e mouse pela borda", xalign=0, hexpand=True, css_classes=["nx-h2"]))
+        use = Gtk.Switch(active=d.get("edge_on", True), valign=Gtk.Align.CENTER,
+                         tooltip_text="Desligado, este dispositivo fica de fora da borda")
+        use.update_property([Gtk.AccessibleProperty.LABEL], ["Usar na borda"])
+        use.connect("notify::active", lambda s, _p: self.daemon.command(
+            {"cmd": "input.config", "device_id": dev, "enabled": s.get_active()},
+            lambda r: self.refresh() if r.get("ok") else self.toast(r.get("error", "falhou"))))
+        head.append(Gtk.Label(label="Usar na borda", css_classes=["dim-label"]))
+        head.append(use)
         btn = Gtk.Button(label="Desativar borda" if on else "Ativar borda",
                          css_classes=["pill"] + ([] if on else ["suggested-action"]))
         btn.connect("clicked", lambda _b: self.daemon.command(
@@ -446,11 +454,14 @@ class Window(Adw.ApplicationWindow):
             where = "neste dispositivo agora" if state.get("current") == dev and state.get("away") else "no PC"
             tip = (f"Borda ativa: o mouse está {where}. Para voltar, empurre a borda do dispositivo que encara o PC "
                    "ou aperte o Ctrl direito duas vezes.")
+        elif not d.get("edge_on", True):
+            tip = "Fora da borda: ligue \"Usar na borda\" para incluir este dispositivo."
         elif on:
             tip = "A borda está ativa, mas sem este dispositivo (não conectou ou caiu). Desative e ative de novo para incluí-lo."
         else:
             tip = ("Arraste o dispositivo até a borda de um monitor, no ponto em que ele fica na sua mesa. Os outros "
-                   "dispositivos aparecem apagados: cada um tem o seu trecho. Ativar borda vale para todos os arranjados; "
+                   "dispositivos aparecem apagados: cada um tem o seu trecho. Ativar borda vale para todos os arranjados com "
+                   "\"Usar na borda\" ligado; "
                    "o GNOME pede permissão e o mouse passa para o dispositivo da borda que você empurrar. "
                    "A Janela de controle, acima, é outro modo: controla pelo scrcpy, com o mouse sobre a janela.")
         card.append(Gtk.Label(label=tip, xalign=0, wrap=True, css_classes=["dim-label"]))
