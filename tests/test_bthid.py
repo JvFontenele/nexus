@@ -9,6 +9,10 @@ class FakeBtHid(bthid.BtHid):
     def __init__(self):
         super().__init__(confirm=lambda name, code: False)
         self.sent = []
+        self.later = []
+
+    def _later(self, fn):
+        self.later.append(fn)
 
     def _send(self, which, report):
         self.sent.append((which, report))
@@ -89,8 +93,16 @@ class TestRelatorios(unittest.TestCase):
         h = FakeBtHid()
         h.button(0x110, True)
         self.assertEqual(h.sent[-1], ("mouse", bytes([1, 0, 0, 0, 0, 0, 0])))
-        h.move(-2, 300)
+        h.move(-1, 100)
+        h.move(-1, 200)  # juntados num relatório só, quando o temporizador vence
+        self.assertEqual(len(h.later), 1)
+        self.assertEqual(h.sent[-1], ("mouse", bytes([1, 0, 0, 0, 0, 0, 0])))
+        h.later.pop()()
         self.assertEqual(h.sent[-1], ("mouse", bytes([1, 0xFE, 0xFF, 0x2C, 0x01, 0, 0])))
+        h.move(5, 0)
+        h.button(0x110, False)  # o clique sai depois do movimento pendente
+        self.assertEqual(h.sent[-2:], [("mouse", bytes([1, 5, 0, 0, 0, 0, 0])), ("mouse", bytes(7))])
+        h.button(0x110, True)
         h.wheel(1, -1)
         self.assertEqual(h.sent[-1], ("mouse", bytes([1, 0, 0, 0, 0, 1, 0xFF])))
 

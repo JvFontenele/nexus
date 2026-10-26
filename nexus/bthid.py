@@ -34,6 +34,7 @@ PROPS = "org.freedesktop.DBus.Properties"
 ROOT = "/dev/nexus/bthid"
 KEYBOARD_ID, MOUSE_ID, CONSUMER_ID = 1, 2, 3
 PAIR_SECONDS = 120
+MOVE_MS = 15  # o movimento é juntado: uma notificação por vez, senão a fila do BLE atrasa o cursor
 # teclas de mídia: as mesmas da tabela MEDIA do android_input, como usos da página Consumer (0x0C)
 CONSUMER = {113: 0xE2, 114: 0xEA, 115: 0xE9, 163: 0xB5, 164: 0xCD, 165: 0xB6, 166: 0xB7}
 assert set(CONSUMER) == set(MEDIA)
@@ -258,9 +259,22 @@ class Peripheral:
         return dbus.Interface(self._bus.get_object(BLUEZ, self._adapter), name)
 
     # ── estado dos aparelhos ──
+    def _path(self, address: str) -> str:
+        """Caminho do aparelho no BlueZ. Pareado por endereço aleatório (o celular usa RPA), o caminho
+        fica com esse endereço e só a propriedade Address tem o fixo: procure por ela."""
+        try:
+            objs = dbus.Interface(self._bus.get_object(BLUEZ, "/"), "org.freedesktop.DBus.ObjectManager").GetManagedObjects()
+        except dbus.exceptions.DBusException:
+            objs = {}
+        for path, ifaces in objs.items():
+            dev = ifaces.get("org.bluez.Device1")
+            if dev and str(path).startswith(self._adapter + "/") and str(dev.get("Address", "")).upper() == address.upper():
+                return str(path)
+        return dev_path(self._adapter, address)
+
     def connected(self, address: str) -> bool:
         try:
-            dev = self._bus.get_object(BLUEZ, dev_path(self._adapter, address))
+            dev = self._bus.get_object(BLUEZ, self._path(address))
             return bool(dbus.Interface(dev, PROPS).Get("org.bluez.Device1", "Connected"))
         except (dbus.exceptions.DBusException, AttributeError):
             return False
@@ -269,7 +283,7 @@ class Peripheral:
         """`on_change(conectado)` a cada mudança de Device1.Connected; mantém o anúncio de reconexão
         no ar só enquanto o aparelho com bond está desconectado."""
         def setup():
-            path = dev_path(self._adapter, address)
+            path = self._path(address)  # ponytail: lido uma vez; se o BlueZ trocar o caminho, só reiniciando o nexusd
 
             def changed(iface, props, _inv):
                 if iface == "org.bluez.Device1" and "Connected" in props:
@@ -278,7 +292,10 @@ class Peripheral:
             if address not in self._watches:
                 self._bus.add_signal_receiver(changed, "PropertiesChanged", PROPS, BLUEZ, path)
             self._watches[address] = on_change
-            self._sync_reconnect(not self.connected(address))
+            on = self.connected(address)
+            self._sync_reconnect(not on)
+            if on:  # já conectado (ex.: acabou de parear): sem isto ninguém avisa até cair e voltar
+                on_change(True)
         self._idle(setup)
 
     def _sync_reconnect(self, wanted: bool):
@@ -379,6 +396,9 @@ class BtHid:
         self.accel = accel or (1.0, 500.0, 3000.0, 3.0)  # padrão AOSP, ou o salvo da última vez com adb
         self._media = None
         self._closed = False
+        self._lock = threading.Lock()
+        self._dx = self._dy = 0
+        self._pending = False
 
     def start(self):
         pass
@@ -401,16 +421,34 @@ class BtHid:
 
     def button(self, code, down):
         if code in BUTTONS:
+            self._flush()
             self.hid.button(code, down)
             self._send("mouse", self.hid.mouse_report())
 
     def move(self, dx, dy):
-        self._send("mouse", self.hid.mouse_report(dx=dx, dy=dy))
+        with self._lock:
+            self._dx += dx
+            self._dy += dy
+            if self._pending:
+                return
+            self._pending = True
+        self._later(self._flush)
+
+    def _later(self, fn):
+        GLib.timeout_add(MOVE_MS, lambda: fn() and False)
+
+    def _flush(self):
+        with self._lock:
+            dx, dy, self._dx, self._dy, self._pending = self._dx, self._dy, 0, 0, False
+        if dx or dy:
+            self._send("mouse", self.hid.mouse_report(dx=dx, dy=dy))
 
     def wheel(self, vertical, horizontal):
+        self._flush()
         self._send("mouse", self.hid.mouse_report(wheel=vertical, pan=horizontal))
 
     def release_all(self):
+        self._flush()
         self.hid.release_all()
         self._send("keyboard", self.hid.key_report())
         self._send("mouse", self.hid.mouse_report())

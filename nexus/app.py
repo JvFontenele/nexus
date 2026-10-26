@@ -279,6 +279,13 @@ class Window(Adw.ApplicationWindow):
             self.refresh()
         elif kind in ("device.connected", "device.disconnected", "audio.changed", "file.received"):
             self.refresh()
+        elif kind == "bt.confirm":
+            self.ask_bt_confirm(ev)
+        elif kind == "bt.pair.end":
+            self.toast(f"Pareamento por Bluetooth: {ev.get('reason')}")
+            self.refresh()
+        elif kind == "bt.connected":
+            self.toast("Conectado por Bluetooth" if ev.get("connected") else "Desconectado do Bluetooth")
         elif kind == "input.screen":
             self.refresh()  # girou o dispositivo: o editor redesenha na proporção nova
         elif kind == "input.crossed":
@@ -447,6 +454,8 @@ class Window(Adw.ApplicationWindow):
                    "o GNOME pede permissão e o mouse passa para o dispositivo da borda que você empurrar. "
                    "A Janela de controle, acima, é outro modo: controla pelo scrcpy, com o mouse sobre a janela.")
         card.append(Gtk.Label(label=tip, xalign=0, wrap=True, css_classes=["dim-label"]))
+        if not d.get("peer"):
+            card.append(self.render_transport(d))
         card.append(arranjo_editor(d["name"], d.get("arrangement"), lambda arr: self.daemon.command(
             {"cmd": "input.config", "device_id": dev, **arr},
             lambda r: self.toast("Posição salva" if r.get("ok") else r.get("error", "falhou"))), d.get("screen"),
@@ -457,6 +466,49 @@ class Window(Adw.ApplicationWindow):
             self.daemon.command({"cmd": "input.screen", "device_id": dev},
                                 lambda r: r.get("screen") != d.get("screen") and self.refresh())
         self.content.append(card)
+
+    def render_transport(self, d: dict) -> Gtk.Widget:
+        """Como a entrada chega ao aparelho: adb/UHID (padrão) ou Bluetooth LE (ADR-0006)."""
+        dev, bt = d["device_id"], d.get("transport") == "bluetooth"
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        row = Gtk.Box(spacing=10)
+        row.append(Gtk.Label(label="Conexão", xalign=0, hexpand=True, css_classes=["heading"]))
+        choice = Gtk.DropDown.new_from_strings(["Cabo ou depuração sem fio (adb)", "Bluetooth"])
+        choice.set_selected(1 if bt else 0)
+        choice.update_property([Gtk.AccessibleProperty.LABEL], ["Conexão do teclado e mouse"])
+        choice.connect("notify::selected", lambda c, _p: self.daemon.command(
+            {"cmd": "input.config", "device_id": dev, "transport": "bluetooth" if c.get_selected() == 1 else "adb"},
+            lambda r: self.refresh() if r.get("ok") else (self.toast(r.get("error", "falhou")), self.refresh())))
+        row.append(choice)
+        box.append(row)
+        box.append(Gtk.Label(label=(
+            "Bluetooth: sem cabo nem depuração, mas só um aparelho pode usar. No aparelho, escolha o layout "
+            "Português (Brasil) em Teclado físico."), xalign=0, wrap=True, css_classes=["dim-label"]))
+        if bt:
+            row = Gtk.Box(spacing=10)
+            state = "pareado por Bluetooth" if d.get("bt_address") else "ainda não pareado por Bluetooth"
+            row.append(Gtk.Label(label=state, xalign=0, hexpand=True))
+            pair = Gtk.Button(label="Parear por Bluetooth", css_classes=["pill"])
+            pair.connect("clicked", lambda _b: self.daemon.command(
+                {"cmd": "input.bt_pair", "device_id": dev},
+                lambda r: self.toast(f"No aparelho, procure \"{GLib.get_host_name()[:20]}\" no Bluetooth (2 min)") if r.get("ok")
+                else self.toast(r.get("error", "falhou"))))
+            row.append(pair)
+            box.append(row)
+        return box
+
+    def ask_bt_confirm(self, ev: dict):
+        """O aparelho quer o bond por Bluetooth: confirme só se o código for o mesmo nos dois."""
+        dlg = Adw.AlertDialog(heading=f"{ev['name']} quer parear por Bluetooth",
+                              body="Confirme só se o aparelho mostrar o mesmo código.")
+        dlg.set_extra_child(Gtk.Label(label=f"{ev['code'][:3]} {ev['code'][3:]}", css_classes=["title-1", "monospace"]))
+        dlg.add_response("reject", "Recusar")
+        dlg.add_response("accept", "Confirmar")
+        dlg.set_response_appearance("accept", Adw.ResponseAppearance.SUGGESTED)
+        dlg.set_default_response("reject")
+        dlg.connect("response", lambda _d, r: self.daemon.command(
+            {"cmd": "bt.confirm", "pid": ev["pid"], "accept": r == "accept"}, lambda _r: None))
+        dlg.present(self)
 
     def render_permissions(self, d: dict) -> Gtk.Widget:
         card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, css_classes=["nx-card"])

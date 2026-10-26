@@ -426,6 +426,101 @@ class TestDaemon(unittest.TestCase):
         self.assertTrue(cmd(cmd="input.release")["ok"])
         cap.stop.assert_called_once()
 
+    def _fake_bt(self):
+        test = self
+
+        class FakePeriph:
+            def __init__(self):
+                self.on, self.watches, self.pairs, self.sent = False, {}, [], []
+
+            def start(self):
+                pass
+
+            def connected(self, addr):
+                return self.on
+
+            def watch(self, addr, cb):
+                self.watches[addr] = cb
+
+            def pair(self, confirm, bonded, end):
+                self.pairs.append((confirm, bonded, end))
+
+            def send(self, which, report):
+                self.sent.append(which)
+        periph = FakePeriph()
+        self.d.bt_factory = lambda: periph  # nunca o BlueZ de verdade nos testes
+        return periph
+
+    def test_bluetooth_transport_at_most_one(self):
+        self.pair()
+        self.pair(self.tablet)
+        self._fake_bt()
+        cmd = lambda **req: self.call(self.d._control_cmd(req))
+        tab = device_id(self.tablet[0])
+        self.assertFalse(cmd(cmd="input.config", device_id=self.fp_phone, transport="usb")["ok"])
+        self.assertTrue(cmd(cmd="input.config", device_id=self.fp_phone, transport="bluetooth")["ok"])
+        self.assertIn("só um aparelho", cmd(cmd="input.config", device_id=tab, transport="bluetooth")["error"])
+        self.assertTrue(cmd(cmd="input.config", device_id=self.fp_phone, transport="adb")["ok"])
+        self.assertTrue(cmd(cmd="input.config", device_id=tab, transport="bluetooth")["ok"])  # agora pode
+        listed = {d["device_id"]: d["transport"] for d in cmd(cmd="devices.list")["devices"]}
+        self.assertEqual((listed[self.fp_phone], listed[tab]), ("adb", "bluetooth"))
+
+    def test_bluetooth_sink_chosen_and_pairing(self):
+        from unittest import mock
+        from nexus import bthid
+        self.pair()
+        periph = self._fake_bt()
+        cmd = lambda **req: self.call(self.d._control_cmd(req))
+        dev = self.fp_phone
+        events = []
+        self.d.emit = events.append
+        self.assertTrue(cmd(cmd="devices.allow", device_id=dev, action="input.control")["ok"])
+        self.assertTrue(cmd(cmd="input.config", device_id=dev, transport="bluetooth", edge="right",
+                            monitor=[0, 0, 1920, 1080], start=0.2, end=0.7)["ok"])
+        # pareamento: a confirmação vai ao app (evento) e volta pelo comando bt.confirm
+        self.assertTrue(cmd(cmd="input.bt_pair", device_id=dev)["ok"])
+        confirm, bonded, _end = periph.pairs[0]
+        answer = []
+        t = threading.Thread(target=lambda: answer.append(confirm("POCO", "123456")))
+        t.start()
+        for _ in range(100):
+            ask = [e for e in events if e.get("event") == "bt.confirm"]
+            if ask:
+                break
+            time.sleep(0.02)
+        self.assertEqual(ask[0]["code"], "123456")
+        self.assertTrue(cmd(cmd="bt.confirm", pid=ask[0]["pid"], accept=True)["ok"])
+        t.join(5)
+        self.assertEqual(answer, [True])
+        bonded("AA:BB:CC:DD:EE:FF")
+        for _ in range(100):
+            if self.d.store.records[dev].get("bt_address"):
+                break
+            time.sleep(0.02)
+        self.assertEqual(self.d.store.records[dev]["bt_address"], "AA:BB:CC:DD:EE:FF")
+        self.d.store.update(dev, "screen", [1080, 2400])
+        self.d.store.update(dev, "accel", [1.0, 500.0, 3000.0, 3.0])
+        cap = mock.MagicMock()
+        with mock.patch("nexus.actions.desktop._adb_device", side_effect=AssertionError("sem adb no Bluetooth")), \
+                mock.patch("nexus.capture.Capture", return_value=cap):
+            self.assertIn("não está conectado", cmd(cmd="input.start")["error"])  # desconectado: sem barreira
+            periph.on = True
+            self.assertTrue(cmd(cmd="input.start")["ok"])
+        sink = self.d.kvm["mux"].targets[dev].sink
+        self.assertIsInstance(sink, bthid.BtHid)
+        self.assertEqual((sink.size, sink.accel), ((1080, 2400), (1.0, 500.0, 3000.0, 3.0)))
+        # desconectou: a barreira sai; conectou de novo: volta
+        self.on_loop(lambda: self.d._bt_changed(dev, False))
+        self.assertNotIn(dev, self.d.kvm["mux"].targets)
+        with mock.patch("nexus.capture.Capture", return_value=cap):
+            self.on_loop(lambda: self.d._bt_changed(dev, True))
+            for _ in range(100):
+                if dev in self.d.kvm["mux"].targets:
+                    break
+                time.sleep(0.02)
+        self.assertIn(dev, self.d.kvm["mux"].targets)
+        self.assertEqual(len(cap.set_regions.call_args[0][0]), 1)
+
     def test_audio_stream(self):
         import struct as st
         import sys

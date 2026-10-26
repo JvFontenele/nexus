@@ -33,6 +33,7 @@ SEEN_IDS = 1024  # ids lembrados por conexão para detectar replay
 # permissão no sentido inverso das ações: o PC pode controlar este dispositivo (padrão: desligada)
 INPUT_CONTROL = "input.control"
 INPUT_INJECT = "input.inject"  # este PC aceita ser controlado por aquele PC (padrão: desligada)
+TRANSPORTS = ("adb", "bluetooth")
 INPUT_DEAD = 2.5  # s sem frame do controlador: solta tudo e encerra
 SENT_HOME = 5.0   # s em que um PC mandado para casa não pode voltar
 HOST_RE = __import__("re").compile(r"[A-Za-z0-9.:-]{1,253}")
@@ -138,6 +139,12 @@ class Daemon:
         self.owner = None  # posse (outro PC controla este): {"device_id", "conn", "injector", "receiver"}
         self.sent_home: dict[str, tuple[float, int]] = {}  # device_id → (prazo monotônico, sessão de posse)
         self.peers = TrustStore(data / "peers.json")  # PCs que este controla (certificado pinado)
+        self.bt = None  # periférico BLE HOGP (ADR-0006), criado sob demanda
+        self.bt_factory = lambda: __import__("nexus.bthid").bthid.Peripheral(self.name[:20] or "Nexus")
+        self._bt_lock = threading.Lock()
+        self._bt_watched: set[str] = set()
+        self.bt_confirms: dict[str, dict] = {}
+        self._aloop = None
         self.peer_pairings: dict[str, tuple] = {}
         self.agent_requests: dict[str, dict] = {}  # id → {"info", "fut"}: pedidos de permissão do Claude Code
         self.agent_timeout = AGENT_TIMEOUT
@@ -148,6 +155,9 @@ class Daemon:
 
     # ── ciclo de vida ────────────────────────────────────────────────────
     async def start(self):
+        self._aloop = asyncio.get_running_loop()
+        if any(r.get("transport") == "bluetooth" for r in self.store.records.values()):
+            asyncio.ensure_future(asyncio.to_thread(self._bt_ensure))  # o periférico vive enquanto o daemon roda
         for host in self.listen:
             self.servers.append(await asyncio.start_server(self._handle, host, self.port))
 
@@ -635,6 +645,19 @@ class Daemon:
         store, rec = self._target(dev_id)
         if rec is None:
             return {"ok": False, "error": "dispositivo não pareado"}
+        if "transport" in req:
+            t = req["transport"]
+            if t not in TRANSPORTS or store is not self.store:
+                return {"ok": False, "error": "transporte inválido"}
+            other = next((r for r in self.store.records.values()
+                          if r["device_id"] != dev_id and r.get("transport") == "bluetooth"), None)
+            if t == "bluetooth" and other:  # o BlueZ manda o relatório a todos os inscritos: um aparelho só
+                return {"ok": False, "error": f"só um aparelho pode usar Bluetooth; hoje é o {other['name']}"}
+            store.update(dev_id, "transport", t)
+            if t == "bluetooth":
+                asyncio.ensure_future(asyncio.to_thread(self._bt_ensure))
+            if "edge" not in req:
+                return {"ok": True}
         try:
             arr = check_arrangement(req)
         except ValueError as e:
@@ -653,6 +676,14 @@ class Daemon:
         from nexus.actions import desktop
         dev_id = rec["device_id"]
         lost = lambda *reason: self._target_lost(session, dev_id, reason[0] if reason else "adb/scrcpy caiu")
+        if rec.get("transport") == "bluetooth":
+            from nexus import bthid
+            if not rec.get("bt_address"):
+                raise RuntimeError("pareie por Bluetooth primeiro")
+            periph = await asyncio.to_thread(self._bt_ensure)
+            if not await asyncio.to_thread(periph.connected, rec["bt_address"]):
+                raise RuntimeError("não está conectado por Bluetooth (entra na borda quando conectar)")
+            return bthid.BtHid(periph, rec.get("screen"), accel_from(rec.get("accel")))
         if store is self.peers:
             sink = peer.PeerSink(rec, self.cert, self.key, on_lost=lost,
                                  on_home=lambda frac: session["mux"].targets.get(dev_id) and
@@ -700,24 +731,18 @@ class Daemon:
                 zs = sink.zones
                 self._set_screen(rec["device_id"], (max(z[0] + z[2] for z in zs) - min(z[0] for z in zs),
                                                     max(z[1] + z[3] for z in zs) - min(z[1] for z in zs)))
-            elif store is self.store:
+            elif store is self.store and rec.get("transport") != "bluetooth":
                 self._set_screen(rec["device_id"], sink.size)
+                store.update(rec["device_id"], "accel", sink.accel)  # para quando o aparelho vier por Bluetooth
                 if await asyncio.to_thread(sink.autoclick_on):
                     warnings.append(f"{rec['name']}: {AUTOCLICK_WARNING}")
         if not opened:
             self.kvm = None
             return {"ok": False, "error": "; ".join(f"{n}: {e}" for n, e in failures.items())}
-        regions = []
+        session["regions"] = []
         for store, rec, sink in opened:
-            dev_id, arr = rec["device_id"], rec["arrangement"]
-
-            def crossed(away, reason=None, dev_id=dev_id):
-                self.emit({"event": "input.crossed", "device_id": dev_id, "away": away, "active": True, "reason": reason})
-            mux.add(dev_id, kvm.Travessia(arr["edge"], sink, mux._release, start=arr["start"], end=arr["end"],
-                                          on_change=crossed))
-            regions.append((dev_id, arr["edge"], (tuple(arr["monitor"]), arr["start"], arr["end"])))
-        session["regions"] = regions
-        session["capture"] = capture.Capture(regions, mux)
+            self._add_target(session, rec, sink)
+        session["capture"] = capture.Capture(list(session["regions"]), mux)
         session["capture"].start()
         log_event({"event": "input.start", "targets": [r["device_id"] for _s, r, _k in opened]})
         for _s, rec, _k in opened:
@@ -725,6 +750,94 @@ class Daemon:
         warnings += [f"{n}: {e}" for n, e in failures.items()]
         return {"ok": True, "targets": [r["device_id"] for _s, r, _k in opened],
                 **({"warning": "\n".join(warnings)} if warnings else {})}
+
+    def _add_target(self, session: dict, rec: dict, sink):
+        """Põe o alvo no Mux e a barreira dele na lista (a Capture é avisada por quem chama, se já existe)."""
+        from nexus import kvm
+        dev_id, arr, mux = rec["device_id"], rec["arrangement"], session["mux"]
+
+        def crossed(away, reason=None):
+            self.emit({"event": "input.crossed", "device_id": dev_id, "away": away, "active": True, "reason": reason})
+        mux.add(dev_id, kvm.Travessia(arr["edge"], sink, mux._release, start=arr["start"], end=arr["end"],
+                                      on_change=crossed))
+        session["regions"].append((dev_id, arr["edge"], (tuple(arr["monitor"]), arr["start"], arr["end"])))
+
+    async def _target_back(self, session: dict, dev_id: str):
+        """Um alvo voltou (ex.: conectou por Bluetooth) com a borda ativa: entra com a barreira dele."""
+        store, rec = self._target(dev_id)
+        if self.kvm is not session or rec is None or dev_id in session["mux"].targets or not rec.get("arrangement"):
+            return
+        try:
+            sink = await self._open_sink(store, rec, session, asyncio.get_running_loop())
+        except Exception:
+            return
+        if self.kvm is not session or dev_id in session["mux"].targets:
+            sink.close()
+            return
+        self._add_target(session, rec, sink)
+        session["capture"].set_regions(session["regions"])
+        self.emit({"event": "input.crossed", "device_id": dev_id, "away": False, "active": True})
+
+    # ── Bluetooth LE HOGP (nexus/bthid.py, ADR-0006) ─────────────────────
+    def _bt_ensure(self):
+        """Sobe o periférico BLE uma vez (thread GLib própria) e vigia a conexão do aparelho com bond.
+        Nunca é desregistrado enquanto o daemon roda. Bloqueia: chame numa thread."""
+        with self._bt_lock:
+            if self.bt is None:
+                periph = self.bt_factory()
+                periph.start()
+                self.bt = periph
+            for rec in self.store.records.values():
+                addr = rec.get("bt_address")
+                if rec.get("transport") == "bluetooth" and addr and addr not in self._bt_watched:
+                    self._bt_watched.add(addr)
+                    dev_id = rec["device_id"]
+                    self.bt.watch(addr, lambda on, dev_id=dev_id: self._aloop.call_soon_threadsafe(
+                        self._bt_changed, dev_id, on))
+            return self.bt
+
+    def _bt_changed(self, dev_id: str, connected: bool):
+        """Device1.Connected mudou: a barreira do aparelho existe só enquanto ele está conectado."""
+        self.emit({"event": "bt.connected", "device_id": dev_id, "connected": connected})
+        k = self.kvm
+        if not k or "mux" not in k:
+            return
+        if not connected:
+            self._target_lost(k, dev_id, "desconectou do Bluetooth")
+        else:
+            asyncio.ensure_future(self._target_back(k, dev_id))
+
+    async def _bt_pair(self, dev_id: str) -> dict:
+        """"Parear por Bluetooth": abre a janela (anúncio descobrível, Pairable e Agent1) por 2 min."""
+        rec = self.store.records.get(dev_id)
+        if rec is None or rec.get("transport") != "bluetooth":
+            return {"ok": False, "error": "escolha Bluetooth para este aparelho primeiro"}
+        try:
+            periph = await asyncio.to_thread(self._bt_ensure)
+        except Exception as e:
+            return {"ok": False, "error": str(e) or type(e).__name__}
+        loop = self._aloop
+
+        def confirm(name, code):  # thread do agente: pergunta no app e espera a resposta (60 s)
+            pid = new_offer_id()[:8]
+            entry = {"event": threading.Event(), "ok": False}
+            self.bt_confirms[pid] = entry
+            loop.call_soon_threadsafe(self.emit, {"event": "bt.confirm", "pid": pid, "device_id": dev_id,
+                                                  "name": name[:64], "code": code})
+            entry["event"].wait(60)
+            self.bt_confirms.pop(pid, None)
+            return entry["ok"] is True
+
+        def bonded(address):
+            def save():
+                self.store.update(dev_id, "bt_address", address)
+                log_event({"event": "bt.bonded", "device_id": dev_id})
+                asyncio.ensure_future(asyncio.to_thread(self._bt_ensure))  # passa a vigiar a conexão
+            loop.call_soon_threadsafe(save)
+
+        periph.pair(confirm, bonded, lambda reason: loop.call_soon_threadsafe(
+            self.emit, {"event": "bt.pair.end", "device_id": dev_id, "reason": reason}))
+        return {"ok": True, "seconds": 120}
 
     def _target_lost(self, session: dict, dev_id: str, reason: str):
         """Um alvo caiu (qualquer thread): sai só a barreira dele; sem alvos, a sessão acaba."""
@@ -952,7 +1065,8 @@ class Daemon:
             return await self.confirm(str(req.get("pid")), bool(req.get("accept")))
         if cmd == "devices.list":
             return {"ok": True, "devices": [{**{k: r[k] for k in ("device_id", "name", "kind", "paired_at", "permissions")},
-                                             "arrangement": r.get("arrangement"), "screen": r.get("screen")}
+                                             "arrangement": r.get("arrangement"), "screen": r.get("screen"),
+                                             "transport": r.get("transport", "adb"), "bt_address": r.get("bt_address")}
                                             for r in self.store.records.values()]
                                + [{"device_id": r["device_id"], "name": r["name"], "kind": "pc", "paired_at": r["paired_at"],
                                    "permissions": [INPUT_CONTROL], "arrangement": r.get("arrangement"),
@@ -966,6 +1080,15 @@ class Daemon:
             return {"ok": self.revoke(str(req.get("device_id")))}
         if cmd == "input.status":
             return {"ok": True, **self._input_status()}
+        if cmd == "input.bt_pair":
+            return await self._bt_pair(str(req.get("device_id")))
+        if cmd == "bt.confirm":
+            entry = self.bt_confirms.get(str(req.get("pid")))
+            if entry is None:
+                return {"ok": False, "error": "pedido não encontrado ou expirado"}
+            entry["ok"] = req.get("accept") is True
+            entry["event"].set()
+            return {"ok": True}
         if cmd == "input.screen":
             return await self._input_screen(str(req.get("device_id")))
         if cmd == "input.config":
@@ -1100,6 +1223,15 @@ class Daemon:
         return {"ok": True}
 
 
+def accel_from(saved):
+    """Aceleração salva no registro (de quando houve adb), no formato de kvm.Aceleracao; senão None (padrão)."""
+    if isinstance(saved, list) and len(saved) == 4 and all(isinstance(n, (int, float)) for n in saved):
+        return tuple(saved)
+    if isinstance(saved, dict) and isinstance(saved.get("curve"), list) and saved["curve"]:
+        return saved
+    return None
+
+
 def check_arrangement(req: dict) -> dict:
     """Valida o arranjo vindo da UI local: lado, monitor (geometria lógica) e trecho da borda."""
     from nexus.capture import EDGES
@@ -1152,7 +1284,11 @@ async def _serve(listen: list[str], port: int):
     unpublish = mdns.publish(d.name, d.bound_port, {"id": d.fp_s, "name": d.name, "v": "1"})
     print(f"nexusd: {d.fp_s[:16]}… ouvindo em {', '.join(listen)}:{d.bound_port}", file=sys.stderr)
     try:
-        await asyncio.Event().wait()
+        stop = asyncio.Event()
+        import signal
+        # o systemd para com SIGTERM: sem isto o Python sai sem o finally (sobravam forwards do adb e sessões)
+        asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, stop.set)
+        await stop.wait()
     finally:
         if unpublish:
             unpublish()
