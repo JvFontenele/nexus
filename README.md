@@ -5,6 +5,8 @@
 <p align="center">Integração entre um PC Linux (GNOME) e celulares e tablets Android, no estilo da "Continuidade" da Apple.<br>
 Tudo é próprio, sem KDE Connect nem Zorin Connect, cifrado de ponta a ponta e sem precisar de root.</p>
 
+<p align="center"><img src="docs/img/pc-inicio.png" width="760" alt="App Nexus no PC: aparelhos pareados e as ações do celular"></p>
+
 ## O que faz
 
 **Áudio**
@@ -25,6 +27,11 @@ Tudo é próprio, sem KDE Connect nem Zorin Connect, cifrado de ponta a ponta e 
 **No topo da tela**
 - Um notch dentro da extensão [Balão](https://github.com/JvFontenele/balao), com o mascote Nexo: aparelhos, áudio, transferências e pareamento.
 - **Aprovar os pedidos de permissão do Claude Code** pelo notch (Negar, Permitir, Sempre ou "No terminal"). Se algo falhar, o terminal pergunta: o Nexus nunca aprova sozinho.
+
+## Telas
+| Teclado e mouse pela borda, no PC | App Android: Início e Áudio |
+|---|---|
+| <img src="docs/img/pc-borda.png" alt="Aba Teclado e mouse: o celular encostado na borda esquerda do monitor 1, por Bluetooth"> | <img src="docs/img/android.png" alt="App Android com a barra inferior: Início e Áudio"> |
 
 ## Segurança
 - Pareamento com código de 6 dígitos conferido nos dois lados (SAS com commit/reveal) e um certificado por aparelho.
