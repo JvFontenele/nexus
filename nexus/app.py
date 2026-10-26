@@ -278,7 +278,8 @@ class Window(Adw.ApplicationWindow):
             self.toast(f"Pareado com {ev.get('name', 'dispositivo')}" if ev.get("ok")
                        else f"Pareamento falhou: {ev.get('reason', '')}")
             self.refresh()
-        elif kind in ("device.connected", "device.disconnected", "audio.changed", "audio.in.changed", "file.received"):
+        elif kind in ("device.connected", "device.disconnected", "audio.changed", "audio.in.changed", "file.received",
+                      "device.changed"):
             self.refresh()
         elif kind == "bt.confirm":
             self.ask_bt_confirm(ev)
@@ -545,7 +546,7 @@ class Window(Adw.ApplicationWindow):
             label = "Mandar o áudio dele para tocar neste PC"
             row.append(Gtk.Label(label=label, xalign=0, hexpand=True))
             sw = Gtk.Switch(active="audio.in" in d["permissions"], valign=Gtk.Align.CENTER,
-                            tooltip_text="Sem isso, só quando você pede pelo botão Trazer áudio")
+                            tooltip_text="Desligado, o PC pergunta a cada vez")
             sw.update_property([Gtk.AccessibleProperty.LABEL], [label])
             sw.connect("notify::active", self.toggle_permission, d["device_id"], "audio.in")
             row.append(sw)

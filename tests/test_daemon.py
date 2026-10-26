@@ -578,21 +578,24 @@ class TestDaemon(unittest.TestCase):
         sink = [sys.executable, "-c", f"import sys\nf = open({str(out)!r}, 'wb', buffering=0)\n"
                 "while b := sys.stdin.buffer.read1(65536): f.write(b)"]
         fmt = {"rate": 48000, "channels": 2, "format": "s16le"}
-        with mock.patch("nexus.audio.playback_argv", return_value=sink) as argv:
+        answers = [None, "sempre"]
+        with mock.patch("nexus.audio.playback_argv", return_value=sink) as argv, \
+                mock.patch("nexus.actions.desktop.ask_audio_in", side_effect=lambda name: answers.pop(0)) as ask:
             a = self.client(self.phone)
+            self.assertNotIn("audio.in", self.d.store.records[self.fp_phone]["permissions"])  # nasce desligada
             a.send("audio.push", fmt)
-            self.assertEqual(a.recv()["body"]["code"], "forbidden")  # permissão desligada por padrão
+            self.assertEqual(a.recv()["body"]["code"], "forbidden")  # o PC perguntou e o usuário negou
+            ask.assert_called_once_with("teste")
             # o PC pede: vale uma vez, sem a permissão
             self.assertTrue(self.call(self.d._control_cmd({"cmd": "audio.in.start", "device_id": self.fp_phone}))["ok"])
             self.assertEqual(c.recv()["type"], "audio.in.start")
             a = self.client(self.phone)
             a.send("audio.push", {**fmt, "rate": 44100})
             self.assertEqual(a.recv()["body"]["code"], "bad_format")
-            self.assertTrue(self.call(self.d._control_cmd({"cmd": "devices.allow", "device_id": self.fp_phone,
-                                                             "action": "audio.in"}))["ok"])
             a = self.client(self.phone)
-            a.send("audio.push", fmt)
+            a.send("audio.push", fmt)  # usa o pedido do PC, sem perguntar
             self.assertEqual(a.recv()["body"], fmt)
+            self.assertEqual(ask.call_count, 1)
             for i in range(3):
                 a.raw(st.pack(">I", 1920) + bytes([i]) * 1920)
             for _ in range(100):
@@ -613,6 +616,11 @@ class TestDaemon(unittest.TestCase):
                     break
                 time.sleep(0.02)
             self.assertEqual(self.call(self.d._control_cmd({"cmd": "devices.list"}))["audio_in"], [])
+            b = self.client(self.phone)
+            b.send("audio.push", fmt)  # o pedido do PC já foi usado: pergunta de novo, e agora "Sempre permitir"
+            self.assertEqual(b.recv()["body"], fmt)
+            self.assertIn("audio.in", self.d.store.records[self.fp_phone]["permissions"])
+            b.s.close()
         self.assertIn({"event": "audio.in.changed", "device_id": self.fp_phone, "on": False}, events)
 
     def test_file_push_and_pull(self):

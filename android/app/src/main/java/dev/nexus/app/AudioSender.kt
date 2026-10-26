@@ -17,7 +17,7 @@ import kotlin.concurrent.thread
  * confirmada pelo usuário a cada sessão), PCM s16 48 kHz estéreo em blocos de 10 ms por uma conexão `audio.push`.
  * Apps que proíbem a captura (e as ligações) ficam de fora: é regra do Android.
  */
-class AudioSender(private val ctx: Context, private val onStatus: (String?) -> Unit) {
+class AudioSender(private val ctx: Context, private val onEnd: () -> Unit, private val onStatus: (String?) -> Unit) {
     @Volatile private var session: Session? = null
     @Volatile private var worker: Thread? = null
     @Volatile private var projection: MediaProjection? = null
@@ -35,11 +35,12 @@ class AudioSender(private val ctx: Context, private val onStatus: (String?) -> U
                 run(mp)
                 null
             } catch (e: Exception) {
-                if (session == null) null else "Áudio para o PC: ${e.message ?: e.javaClass.simpleName}"
+                if (session == null) null else "Não foi: ${(e.message ?: e.javaClass.simpleName).removePrefix("forbidden: ")}"
             }
             session = null
             projection?.let { projection = null; runCatching { it.stop() } }
             onStatus(msg)
+            onEnd()
         }
     }
 
@@ -70,7 +71,7 @@ class AudioSender(private val ctx: Context, private val onStatus: (String?) -> U
         try {
             Session(host, PORT, Identity.load(), pin = pin, presentCert = true).use { s ->
                 session = s
-                s.timeoutMs = 10_000
+                s.timeoutMs = 75_000 // sem a permissão, o PC pergunta ao usuário (até 60 s)
                 s.request("audio.push", JSONObject().put("rate", RATE).put("channels", 2).put("format", "s16le"), "audio.ready")
                 rec.startRecording()
                 onStatus("Mandando o áudio para o PC")

@@ -33,7 +33,7 @@ SEEN_IDS = 1024  # ids lembrados por conexão para detectar replay
 # permissão no sentido inverso das ações: o PC pode controlar este dispositivo (padrão: desligada)
 INPUT_CONTROL = "input.control"
 INPUT_INJECT = "input.inject"  # este PC aceita ser controlado por aquele PC (padrão: desligada)
-AUDIO_IN = "audio.in"  # o dispositivo pode mandar o áudio dele para tocar neste PC (padrão: desligada)
+AUDIO_IN = "audio.in"  # o dispositivo pode mandar o áudio dele sem perguntar (padrão: desligada, o PC pergunta)
 AUDIO_ASK = 120  # s em que um pedido do PC (audio.in.start) vale como permissão, uma vez
 TRANSPORTS = ("adb", "bluetooth")
 INPUT_DEAD = 2.5  # s sem frame do controlador: solta tudo e encerra
@@ -133,6 +133,7 @@ class Daemon:
         self.audio_out_previous = None  # saída padrão de antes do "Nexus → …" (o áudio de volta não ecoa no aparelho)
         self.audio_in: dict[str, Conn] = {}  # device_id → conexão audio.push: vários ao mesmo tempo
         self.audio_in_asked: dict[str, float] = {}  # device_id → prazo monotônico do pedido do PC
+        self.audio_in_asking: set[str] = set()  # dispositivos com a pergunta "Permitir?" na tela
         self.offers: dict[str, tuple[str, Path, float]] = {}  # id → (device_id, arquivo, prazo)
         self.transfers: dict[str, dict] = {}  # id → {"conn", "last"}: para progresso e cancelamento
         self.handshaking = 0
@@ -530,11 +531,11 @@ class Daemon:
         if conn.record is None:
             raise ProtocolError("unauthorized", "dispositivo não pareado")
         dev = conn.device_id
-        asked = self.audio_in_asked.pop(dev, 0) > time.monotonic()
-        if AUDIO_IN not in conn.record["permissions"] and not asked:
-            raise ProtocolError("forbidden", "este PC não recebe o áudio deste dispositivo")
         if (body["rate"], body["channels"], body["format"]) != (audio.RATE, audio.CHANNELS, "s16le"):
             raise ProtocolError("bad_format", "mande s16le, 48 kHz, estéreo")
+        asked = self.audio_in_asked.pop(dev, 0) > time.monotonic()
+        if AUDIO_IN not in conn.record["permissions"] and not asked:
+            await self._ask_audio_in(conn)
         old = self.audio_in.get(dev)
         if old is not None:
             old.writer.transport.abort()  # um fluxo por dispositivo: o novo assume
@@ -569,6 +570,24 @@ class Daemon:
                 del self.audio_in[dev]
             log_event({"event": "audio.in.stop", "device_id": dev})
             self.emit({"event": "audio.in.changed", "device_id": dev, "on": False})
+
+    async def _ask_audio_in(self, conn: Conn):
+        """O dispositivo pediu sem permissão: pergunta numa notificação (Permitir, Sempre permitir, Negar)."""
+        from nexus.actions import desktop
+        dev = conn.device_id
+        if dev in self.audio_in_asking:
+            raise ProtocolError("forbidden", "o PC já está perguntando")
+        self.audio_in_asking.add(dev)
+        try:
+            answer = await asyncio.to_thread(desktop.ask_audio_in, conn.record["name"])
+        finally:
+            self.audio_in_asking.discard(dev)
+        log_event({"event": "audio.in.asked", "device_id": dev, "answer": answer or "none"})
+        if answer == "sempre":
+            self.store.allow(dev, AUDIO_IN)
+            self.emit({"event": "device.changed", "device_id": dev})
+        elif answer != "uma":
+            raise ProtocolError("forbidden", "o PC não permitiu")
 
     def _transfer_start(self, conn: Conn) -> dict:
         t = {"id": new_offer_id()[:16], "conn": conn, "last": 0.0}

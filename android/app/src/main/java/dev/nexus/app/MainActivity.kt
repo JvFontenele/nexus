@@ -94,12 +94,13 @@ class MainActivity : ComponentActivity() {
     private var audioOn by mutableStateOf(false)
     private var audioText by mutableStateOf<String?>(null)
     private var audioOutOn by mutableStateOf(false)
+    private var audioOutText by mutableStateOf<String?>(null)
     private val pedirCaptura = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
         val data = r.data
         status = if (r.resultCode != RESULT_OK || data == null) "Áudio para o PC: cancelado"
         else when (runCatching { LinkService.startAudioOut(r.resultCode, data) }.getOrElse { status = "Erro: ${it.message}"; return@registerForActivityResult }) {
             null -> "Ligue \"Manter conectado\" primeiro"
-            else -> "Mandando o áudio para o PC"
+            else -> "Conectando o áudio ao PC…"
         }
     }
     private val pedirMicrofone = registerForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
@@ -309,6 +310,7 @@ class MainActivity : ComponentActivity() {
                 audioOn = LinkService.audioPlaying()
                 audioText = LinkService.lastAudioText
                 audioOutOn = LinkService.audioSending()
+                audioOutText = LinkService.lastAudioOutText
                 autoclique = LinkService.cliqueAutomatico(this@MainActivity)
                 bateriaLivre = getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
                 delay(1000)
@@ -464,7 +466,7 @@ class MainActivity : ComponentActivity() {
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 Bloco(Icone.AUDIO, Cores.azulClaro, "Áudio do PC aqui", if (audioOn) audioText?.removePrefix("Áudio do PC · ") else null,
                     audioOn, linkUp, Modifier.weight(1f), ::toggleAudio)
-                Bloco(Icone.AUDIO, Cores.verdeClaro, "Áudio daqui no PC", if (audioOutOn) "tocando no PC" else null,
+                Bloco(Icone.AUDIO, Cores.verdeClaro, "Áudio daqui no PC", if (audioOutOn) "tocando no PC" else audioOutText,
                     audioOutOn, linkUp || audioOutOn, Modifier.weight(1f), ::toggleAudioOut)
             }
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {

@@ -45,9 +45,8 @@ class LinkService : Service(), Pc {
         }
     }
     val audioOut by lazy {
-        AudioSender(this) { text ->
+        AudioSender(this, onEnd = { tipo(false) }) { text -> // ao parar, o serviço deixa de ser de captura
             lastAudioOutText = text
-            if (text == null) tipo(false) // parou: o serviço deixa de ser de captura
             atualizar()
         }
     }
