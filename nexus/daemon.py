@@ -30,6 +30,14 @@ MAX_FAILURES = 5
 RATE = 50        # mensagens/s por conexão
 PAIR_RATE = 3    # pair.request por minuto por IP
 SEEN_IDS = 1024  # ids lembrados por conexão para detectar replay
+# permissão no sentido inverso das ações: o PC pode controlar este dispositivo (padrão: desligada)
+INPUT_CONTROL = "input.control"
+INPUT_INJECT = "input.inject"  # este PC aceita ser controlado por aquele PC (padrão: desligada)
+INPUT_DEAD = 2.5  # s sem frame do controlador: solta tudo e encerra
+SENT_HOME = 5.0   # s em que um PC mandado para casa não pode voltar
+HOST_RE = __import__("re").compile(r"[A-Za-z0-9.:-]{1,253}")
+AUTOCLICK_WARNING = ("O clique automático do Android está ligado: o celular vai clicar sozinho quando o ponteiro parar. "
+                     "Desligue em Acessibilidade.")
 
 
 def data_dir() -> Path:
@@ -124,6 +132,14 @@ class Daemon:
         # trocados pela ponte D-Bus (nexus/dbus.py); sem ela o daemon funciona igual
         self.emit = lambda event: None
         self.shell_present = lambda: False
+        self.kvm = None  # travessia ativa (este PC controla): {"device_id", "capture", "travessia"}
+        self.owner = None  # posse (outro PC controla este): {"device_id", "conn", "injector", "receiver"}
+        self.sent_home: dict[str, tuple[float, int]] = {}  # device_id → (prazo monotônico, sessão de posse)
+        self.peers = TrustStore(data / "peers.json")  # PCs que este controla (certificado pinado)
+        self.peer_pairings: dict[str, tuple] = {}
+        from nexus import inject
+        tokens = inject.TokenStore(data / "remote-desktop.token")
+        self.injector_factory = lambda on_lost: inject.RemoteDesktop(tokens, on_lost)
 
     # ── ciclo de vida ────────────────────────────────────────────────────
     async def start(self):
@@ -141,6 +157,7 @@ class Daemon:
         os.chmod(path, 0o600)
 
     async def close(self):
+        await self._input_stop_for(None)
         for s in self.servers:
             s.close()
         for c in list(self.conns):
@@ -217,6 +234,9 @@ class Daemon:
         if t in ("file.push", "file.pull") and conn.hello is None:
             await (self._file_push if t == "file.push" else self._file_pull)(conn, body, rid)
             raise _Close()  # conexão só de dados, como a de áudio
+        if t == "input.attach" and conn.hello is None:
+            await self._input_attach(conn, rid)  # conexão só de entrada de outro PC
+            raise _Close()
         if t == "audio.attach" and conn.hello is None:
             await self._audio(conn, rid)  # conexão só de áudio: não substitui a de controle
             raise _Close()
@@ -375,7 +395,7 @@ class Daemon:
     def allow(self, device_id_: str, action: str) -> dict:
         if device_id_ not in self.store.records:
             return {"ok": False, "error": "dispositivo não pareado"}
-        if action != "*phone_safe":
+        if action not in ("*phone_safe", INPUT_CONTROL, INPUT_INJECT):
             a = catalog.REGISTRY.get(action)
             if a is None or not a.phone_safe:
                 return {"ok": False, "error": "ação inexistente ou não phone_safe"}
@@ -583,6 +603,250 @@ class Daemon:
         finally:
             self._transfer_end(t, "out", path.name, ok)
 
+    # ── travessia do teclado e do mouse (nexus/kvm.py) ───────────────────
+    def _input_status(self) -> dict:
+        k, o = self.kvm, self.owner
+        trav = k.get("travessia") if k else None
+        return {"active": k["device_id"] if k else None, "away": bool(trav and trav.away),
+                "owner": o["device_id"] if o else None}
+
+    def _target(self, dev_id: str):
+        """Registro do alvo: celular/tablet pareado (trusted.json) ou PC que este controla (peers.json)."""
+        if dev_id in self.store.records:
+            return self.store, self.store.records[dev_id]
+        if dev_id in self.peers.records:
+            return self.peers, self.peers.records[dev_id]
+        return None, None
+
+    def _input_config(self, req: dict) -> dict:
+        dev_id = str(req.get("device_id"))
+        store, rec = self._target(dev_id)
+        if rec is None:
+            return {"ok": False, "error": "dispositivo não pareado"}
+        try:
+            arr = check_arrangement(req)
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+        store.update(dev_id, "arrangement", arr)
+        return {"ok": True}
+
+    async def _input_start(self, dev_id: str) -> dict:
+        """"Ativar borda": prepara o alvo (scrcpy-server no celular ou input.attach no outro PC) e abre a
+        sessão InputCapture só agora (o GNOME pergunta ao usuário)."""
+        store, rec = self._target(dev_id)
+        if rec is None:
+            return {"ok": False, "error": "dispositivo não pareado"}
+        is_pc = store is self.peers
+        if not is_pc and INPUT_CONTROL not in rec["permissions"]:
+            return {"ok": False, "error": "controle não liberado para este dispositivo"}
+        arr = rec.get("arrangement")
+        if not arr:
+            return {"ok": False, "error": "posicione o dispositivo ao lado de um monitor primeiro"}
+        if self.owner:  # anti-laço: um PC controlado não controla ninguém
+            return {"ok": False, "error": "este PC está sendo controlado por outro agora"}
+        if self.kvm:
+            return {"ok": False, "error": "a borda já está ativa"}
+        session = {"device_id": dev_id}
+        self.kvm = session  # reservado antes de qualquer await: dois input.start nunca passam juntos
+        from nexus import android_input, capture, kvm, peer
+        from nexus.actions import desktop
+        loop = asyncio.get_running_loop()
+
+        def lost(*_):  # adb, scrcpy ou o outro PC caiu: traz a entrada de volta e encerra a sessão inteira
+            if "travessia" in session:
+                session["travessia"].sink_lost()
+                threading.Thread(target=session["capture"].stop, daemon=True).start()
+
+        def crossed(away, reason=None):
+            self.emit({"event": "input.crossed", "device_id": dev_id, "away": away, "active": True, "reason": reason})
+
+        def ended(reason):
+            loop.call_soon_threadsafe(self._input_ended, session, reason)
+
+        try:
+            if is_pc:
+                sink = peer.PeerSink(rec, self.cert, self.key, on_lost=lost,
+                                     on_home=lambda frac: session["travessia"].remote_home(frac))
+            else:
+                conn = self.by_device.get(dev_id)
+                serial, err = await asyncio.to_thread(desktop._adb_device, rec["name"], conn.ip if conn else None)
+                if err:
+                    raise RuntimeError(err)
+                sink = android_input.AndroidInput(serial, on_lost=lost)
+            try:
+                await asyncio.to_thread(sink.start)
+            except Exception:
+                sink.close()
+                raise
+        except Exception as e:  # versão do scrcpy, adb fora do ar, outro PC recusou ou não respondeu
+            self.kvm = None
+            return {"ok": False, "error": str(e) or type(e).__name__}
+        region = (tuple(arr["monitor"]), arr["start"], arr["end"])
+        session["travessia"] = kvm.Travessia(arr["edge"], sink, lambda p: session["capture"].release(p),
+                                             start=arr["start"], end=arr["end"], on_change=crossed, on_end=ended)
+        session["capture"] = capture.Capture(arr["edge"], session["travessia"], region=region)
+        session["capture"].start()
+        log_event({"event": "input.start", "device_id": dev_id})
+        warning = None
+        if not is_pc and await asyncio.to_thread(sink.autoclick_on):
+            warning = AUTOCLICK_WARNING
+        self.emit({"event": "input.crossed", "device_id": dev_id, "away": False, "active": True,
+                   **({"warning": warning} if warning else {})})
+        return {"ok": True, **({"warning": warning} if warning else {})}
+
+    def _input_ended(self, session: dict, reason):
+        if self.kvm is session:
+            self.kvm = None
+        log_event({"event": "input.stop", "device_id": session["device_id"]})
+        self.emit({"event": "input.crossed", "device_id": session["device_id"], "away": False, "active": False,
+                   "reason": reason})
+
+    async def _input_stop_for(self, dev_id: str | None):
+        """Encerra a borda (de qualquer dispositivo com None). Fechar a sessão devolve a entrada ao PC."""
+        k = self.kvm
+        if k and "capture" in k and (dev_id is None or k["device_id"] == dev_id):
+            await asyncio.to_thread(k["capture"].stop)
+
+    # ── PC↔PC, lado controlado (nexus/inject.py, kvmwire.py) ─────────────
+    async def _input_attach(self, conn: Conn, rid: str):
+        """Conexão de dados de outro PC que quer controlar este. Posse exclusiva decidida aqui, no loop
+        do asyncio (sem await entre conferir e tomar a posse), sem confiar no portal."""
+        rec = conn.record
+        refuse = None
+        if rec is None or rec["device_id"] not in self.store.records:
+            refuse = ("unauthorized", "dispositivo não pareado")
+        elif rec.get("kind") != "pc" or INPUT_INJECT not in rec["permissions"]:
+            refuse = ("not_allowed", "este PC não permite ser controlado por esse dispositivo")
+        elif self.kvm is not None:
+            refuse = ("busy", "este PC está controlando outro agora")  # anti-laço
+        elif self.clock() < self.sent_home.get(rec["device_id"], (0, 0))[0]:
+            refuse = ("sent_home", "mandado para casa há pouco; tente em alguns segundos")
+        elif self.owner is not None:
+            refuse = ("owned", "outro PC já controla este")
+        if refuse:
+            await conn.send(make("error", {"code": refuse[0], "message": refuse[1]}, re=rid))
+            return
+        from nexus import inject, kvmwire
+        loop = asyncio.get_running_loop()
+        session = {"device_id": rec["device_id"], "conn": conn}
+        self.owner = session
+        receiver = None
+        injector = self.injector_factory(lambda reason: loop.call_soon_threadsafe(conn.writer.transport.abort))
+        session["injector"] = injector
+        self.emit({"event": "input.owner", "device_id": rec["device_id"], "active": True})
+        log_event({"event": "input.owner", "device_id": rec["device_id"], "active": True})
+        try:
+            try:
+                await asyncio.to_thread(injector.start)
+            except Exception as e:
+                await conn.send(make("error", {"code": "portal", "message": (str(e) or type(e).__name__)[:200]}, re=rid))
+                return
+            receiver = inject.Receiver(injector, injector.zones, self.clock)
+            session["receiver"] = receiver
+            await conn.send(make("input.ready", {"zones": [list(z) for z in injector.zones]}, re=rid))
+            await self._input_frames(conn, session, receiver, kvmwire)
+        except (kvmwire.WireError, asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError, OSError):
+            pass
+        finally:
+            if receiver is not None:
+                receiver.release_all()  # desconexão, timeout, revogação, portal perdido, erro de parsing
+            await asyncio.to_thread(injector.close)
+            if self.owner is session:
+                self.owner = None
+            conn.writer.transport.abort()  # conexão só de dados: sem esperar o close_notify do outro lado
+            self.emit({"event": "input.owner", "device_id": rec["device_id"], "active": False})
+            log_event({"event": "input.owner", "device_id": rec["device_id"], "active": False})
+
+    async def _input_frames(self, conn: Conn, session: dict, receiver, kvmwire):
+        inbound = kvmwire.Inbound(self.clock)
+        session["out_seq"] = 0
+        last_ping = self.clock()
+        while True:
+            n = kvmwire.frame_length(await asyncio.wait_for(conn.reader.readexactly(4), INPUT_DEAD))
+            seq, records = kvmwire.decode(await asyncio.wait_for(conn.reader.readexactly(n), INPUT_DEAD),
+                                          kvmwire.TO_TARGET)
+            inbound.check(seq, records)
+            if session.get("ended"):
+                return
+            rec = self.store.records.get(session["device_id"])
+            if rec is None or INPUT_INJECT not in rec["permissions"]:
+                await self._bye(session, kvmwire.BYE_NOT_ALLOWED)
+                return
+            out = receiver.handle(records)
+            if out:
+                await self._send_frame(session, out)
+            if self.clock() - last_ping >= 1.0:
+                last_ping = self.clock()
+                await self._send_frame(session, [(kvmwire.PING,)])
+
+    async def _send_frame(self, session: dict, records):
+        from nexus import kvmwire
+        session["out_seq"] = session.get("out_seq", 0) + 1
+        w = session["conn"].writer
+        w.write(kvmwire.encode(session["out_seq"], records))
+        await w.drain()
+
+    async def _bye(self, session: dict, reason: int):
+        """Encerra a posse: solta tudo já, avisa o controlador (BYE) e fecha a conexão."""
+        session["ended"] = True
+        if session.get("receiver"):
+            session["receiver"].release_all()
+            session["receiver"].focus = False
+        try:
+            from nexus import kvmwire
+            await self._send_frame(session, [(kvmwire.BYE, reason)])
+        except (ConnectionError, OSError):
+            pass
+        session["conn"].writer.transport.abort()
+
+    def _send_home(self, dev_id: str | None = None):
+        """Manda o dono atual para casa e recusa a volta dele por SENT_HOME s (cancelável pelo devices.allow)."""
+        from nexus import kvmwire
+        o = self.owner
+        if o and (dev_id is None or o["device_id"] == dev_id):
+            self.sent_home[o["device_id"]] = (self.clock() + SENT_HOME, id(o))  # timer monotônico da sessão de posse
+            asyncio.ensure_future(self._bye(o, kvmwire.BYE_SENT_HOME))
+
+    def _cancel_sent_home(self, dev_id: str):
+        self.sent_home.pop(dev_id, None)
+
+    # ── PC↔PC, lado de quem controla (nexus/peer.py) ─────────────────────
+    async def _peer_pair(self, req: dict) -> dict:
+        from nexus import peer
+        host, port = req.get("host"), req.get("port", PORT)
+        if not isinstance(host, str) or not HOST_RE.fullmatch(host) or type(port) is not int or not 0 < port < 65536:
+            return {"ok": False, "error": "host ou porta inválidos"}
+        p = peer.ClientPairing(host, port, self.cert, self.name)
+        try:
+            info = await asyncio.to_thread(p.start)
+        except Exception as e:
+            return {"ok": False, "error": str(e) or type(e).__name__}
+        if info["fingerprint"] in self.peers.records:
+            p.sock.close()
+            return {"ok": False, "error": "esse PC já está pareado"}
+        pid = new_offer_id()[:8]
+        self.peer_pairings[pid] = (p, self.clock() + 60)
+        return {"ok": True, "pid": pid, **info}
+
+    async def _peer_confirm(self, req: dict) -> dict:
+        entry = self.peer_pairings.pop(str(req.get("pid")), None)
+        if entry is None or self.clock() > entry[1]:
+            if entry:
+                entry[0].sock.close()
+            return {"ok": False, "error": "pareamento não encontrado ou expirado"}
+        p = entry[0]
+        try:
+            ok = await asyncio.to_thread(p.finish, bool(req.get("accept")))
+        except Exception as e:
+            return {"ok": False, "error": str(e) or type(e).__name__}
+        if not ok:
+            return {"ok": False, "error": "pareamento recusado"}
+        self.peers.add(p.fp_s, p.name, "pc", p.server_pem)
+        self.peers.update(p.fp_s, "host", p.host)
+        self.peers.update(p.fp_s, "port", p.port)
+        log_event({"event": "peer.paired", "device_id": p.fp_s})
+        return {"ok": True, "device_id": p.fp_s, "name": p.name}
+
     # ── controle local (CLI) ─────────────────────────────────────────────
     async def _control(self, reader, writer):
         try:
@@ -605,21 +869,53 @@ class Daemon:
         if cmd == "pair.confirm":
             return await self.confirm(str(req.get("pid")), bool(req.get("accept")))
         if cmd == "devices.list":
-            return {"ok": True, "devices": [{k: r[k] for k in ("device_id", "name", "kind", "paired_at", "permissions")}
-                                            for r in self.store.records.values()],
+            return {"ok": True, "devices": [{**{k: r[k] for k in ("device_id", "name", "kind", "paired_at", "permissions")},
+                                             "arrangement": r.get("arrangement")}
+                                            for r in self.store.records.values()]
+                               + [{"device_id": r["device_id"], "name": r["name"], "kind": "pc", "paired_at": r["paired_at"],
+                                   "permissions": [INPUT_CONTROL], "arrangement": r.get("arrangement"), "peer": True}
+                                  for r in self.peers.records.values()],
+                    "input": self._input_status(),
                     "connected": sorted(self.by_device),
                     "audio": self.audio_conn.device_id if self.audio_conn else None}
         if cmd == "devices.revoke":
+            await self._input_stop_for(str(req.get("device_id")))
             return {"ok": self.revoke(str(req.get("device_id")))}
+        if cmd == "input.status":
+            return {"ok": True, **self._input_status()}
+        if cmd == "input.config":
+            return self._input_config(req)
+        if cmd == "input.start":
+            return await self._input_start(str(req.get("device_id")))
+        if cmd == "input.release":  # encerra a borda deste PC e manda para casa quem o controla
+            await self._input_stop_for(None)
+            self._send_home()
+            return {"ok": True}
+        if cmd == "peer.pair":
+            return await self._peer_pair(req)
+        if cmd == "peer.confirm":
+            return await self._peer_confirm(req)
+        if cmd == "peer.list":
+            return {"ok": True, "peers": [{k: r.get(k) for k in ("device_id", "name", "host", "port", "paired_at", "arrangement")}
+                                          for r in self.peers.records.values()]}
+        if cmd == "peer.remove":
+            dev_id = str(req.get("device_id"))
+            await self._input_stop_for(dev_id)
+            return {"ok": self.peers.remove(dev_id)}
         if cmd == "devices.allow":
+            if req.get("action") == INPUT_INJECT:
+                self._cancel_sent_home(str(req.get("device_id")))  # liberar de novo cancela o "mandado para casa"
             return self.allow(str(req.get("device_id")), str(req.get("action")))
-        if cmd == "mirror":
+        if cmd in ("mirror", "input.control"):
             rec = self.store.records.get(str(req.get("device_id")))
             if rec is None:
                 return {"ok": False, "error": "dispositivo não pareado"}
-            from nexus.actions.desktop import mirror
+            if cmd == "input.control" and INPUT_CONTROL not in rec["permissions"]:
+                return {"ok": False, "error": "controle não liberado para este dispositivo"}
+            from nexus.actions import desktop
             conn = self.by_device.get(rec["device_id"])
-            return await asyncio.to_thread(mirror, rec["name"], conn.ip if conn else None)
+            fn = desktop.mirror if cmd == "mirror" else desktop.control
+            return await asyncio.to_thread(fn, rec["name"], conn.ip if conn else None)
         if cmd == "ui.open":
             # o notch do Balão pede: o daemon abre o app ou o seletor (o Shell não tem diálogo de arquivos)
             what, dev = req.get("what"), str(req.get("device_id", ""))
@@ -657,12 +953,32 @@ class Daemon:
             if dev_id not in self.store.records:
                 return {"ok": False, "error": "dispositivo não pareado"}
             self.store.deny(dev_id, str(req.get("action")))
+            if req.get("action") == INPUT_CONTROL:
+                await self._input_stop_for(dev_id)
+            if req.get("action") == INPUT_INJECT and self.owner and self.owner["device_id"] == dev_id:
+                from nexus import kvmwire
+                await self._bye(self.owner, kvmwire.BYE_NOT_ALLOWED)
             return {"ok": True}
         if cmd == "actions":
             return {"ok": True, "actions": _phone_actions()}
         if cmd == "status":
             return {"ok": True, "device_id": self.fp_s, "listen": self.listen, "port": self.port}
         return {"ok": False, "error": "comando desconhecido"}
+
+
+def check_arrangement(req: dict) -> dict:
+    """Valida o arranjo vindo da UI local: lado, monitor (geometria lógica) e trecho da borda."""
+    from nexus.capture import EDGES
+    edge, mon = req.get("edge"), req.get("monitor")
+    start, end = req.get("start"), req.get("end")
+    if edge not in EDGES:
+        raise ValueError("lado inválido")
+    if (not isinstance(mon, list) or len(mon) != 4 or not all(type(v) is int and abs(v) <= 100000 for v in mon)
+            or mon[2] <= 0 or mon[3] <= 0):
+        raise ValueError("monitor inválido")
+    if not all(type(v) in (int, float) for v in (start, end)) or not 0 <= start < end <= 1 or end - start < 0.05:
+        raise ValueError("trecho inválido")
+    return {"edge": edge, "monitor": mon, "start": float(start), "end": float(end)}
 
 
 def new_offer_id() -> str:
@@ -676,10 +992,10 @@ def _phone_actions() -> list[dict]:
             for a in catalog.all_actions() if a.phone_safe]
 
 
-def control(req: dict, path: Path | None = None) -> dict:
+def control(req: dict, path: Path | None = None, timeout: float = 10) -> dict:
     """Cliente do canal de controle (usado pela CLI)."""
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-        s.settimeout(10)
+        s.settimeout(timeout)
         s.connect(str(path or control_path()))
         s.sendall(framing.encode(req))
         return framing.read_frame(framing.recv_exact_from(s))

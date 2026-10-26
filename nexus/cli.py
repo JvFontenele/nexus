@@ -33,6 +33,8 @@ def main(argv=None):
     sub.add_parser("app")
     sub.add_parser("send-file").add_argument("device_id")
     sub.add_parser("mirror").add_argument("device_id", nargs="?", help="prefixo; padrão: o primeiro conectado")
+    sub.add_parser("control", help="teclado e mouse do PC no celular (scrcpy sem vídeo)").add_argument(
+        "device_id", nargs="?", help="prefixo; padrão: o primeiro conectado")
 
     pair = sub.add_parser("pair").add_subparsers(dest="pair_cmd", required=True)
     pair.add_parser("pending")
@@ -40,6 +42,14 @@ def main(argv=None):
         pc = pair.add_parser(name)
         pc.add_argument("pid")
         pc.add_argument("--yes", action="store_true")
+
+    pr = sub.add_parser("peer", help="outro PC para controlar com este teclado e mouse").add_subparsers(
+        dest="peer_cmd", required=True)
+    pp = pr.add_parser("pair")
+    pp.add_argument("host", help="IP ou nome do outro PC, opcionalmente com :porta")
+    pp.add_argument("--yes", action="store_true")
+    pr.add_parser("list")
+    pr.add_parser("remove").add_argument("device_id")
 
     dev = sub.add_parser("devices").add_subparsers(dest="dev_cmd", required=True)
     dev.add_parser("list")
@@ -63,10 +73,12 @@ def main(argv=None):
     if args.command == "send-file":
         from nexus.app import send_file
         return send_file(args.device_id)
-    if args.command == "mirror":
-        return _cmd_mirror(args)
+    if args.command in ("mirror", "control"):
+        return _cmd_mirror(args, "mirror" if args.command == "mirror" else "input.control")
     if args.command == "pair":
         return _cmd_pair(args)
+    if args.command == "peer":
+        return _cmd_peer(args)
     if args.command == "devices":
         return _cmd_devices(args)
 
@@ -149,10 +161,10 @@ def _cmd_run(args):
 
 
 
-def _control(req):
+def _control(req, timeout=10):
     from nexus.daemon import control
     try:
-        return control(req)
+        return control(req, timeout=timeout)
     except OSError:
         print("nexus: nexusd não está rodando (inicie com: nexus daemon)", file=sys.stderr)
         return None
@@ -189,6 +201,31 @@ def _cmd_pair(args):
     return _print_resp(_control({"cmd": "pair.confirm", "pid": args.pid, "accept": accept}))
 
 
+def _cmd_peer(args):
+    if args.peer_cmd == "list":
+        resp = _control({"cmd": "peer.list"})
+        if resp is None:
+            return 1
+        for p in resp["peers"]:
+            arr = p.get("arrangement")
+            where = f"{arr['edge']} do monitor {arr['monitor']}" if arr else "sem posição"
+            print(f"{p['device_id'][:16]}…  {p['name']}  {p['host']}:{p['port']}  {where}")
+        return 0
+    if args.peer_cmd == "remove":
+        return _print_resp(_control({"cmd": "peer.remove", "device_id": args.device_id}))
+    host, _, port = args.host.rpartition(":") if args.host.count(":") == 1 else (args.host, "", "")
+    resp = _control({"cmd": "peer.pair", "host": host or args.host, "port": int(port) if port else 47210}, timeout=20)
+    if resp is None or not resp.get("ok"):
+        return _print_resp(resp)
+    print(f"{resp['name']}\nfingerprint {resp['fingerprint']}\ncódigo {resp['code']}\n"
+          "Confirme também no outro PC (notificação ou `nexus pair confirm`).")
+    accept = args.yes or input("O código é o mesmo do outro PC? [s/N] ").strip().lower() in ("s", "sim", "y")
+    out = _control({"cmd": "peer.confirm", "pid": resp["pid"], "accept": accept}, timeout=75)
+    if out and out.get("ok"):
+        print(f"Pareado. No outro PC, libere com: nexus devices allow <este PC> input.inject")
+    return _print_resp(out)
+
+
 def _cmd_devices(args):
     if args.dev_cmd == "list":
         resp = _control({"cmd": "devices.list"})
@@ -203,7 +240,7 @@ def _cmd_devices(args):
     return _print_resp(_control({"cmd": "devices.allow", "device_id": _full_id(args.device_id), "action": args.action}))
 
 
-def _cmd_mirror(args):
+def _cmd_mirror(args, cmd="mirror"):
     resp = _control({"cmd": "devices.list"})
     if resp is None:
         return 1
@@ -215,7 +252,7 @@ def _cmd_mirror(args):
     if not ids:
         print("nexus: nenhum dispositivo pareado", file=sys.stderr)
         return 2
-    return _print_resp(_control({"cmd": "mirror", "device_id": ids[0]}))
+    return _print_resp(_control({"cmd": cmd, "device_id": ids[0]}))
 
 
 def _full_id(prefix):

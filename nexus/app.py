@@ -64,7 +64,110 @@ window.nexus, .nx-bg { background-color: #0B0C10; color: #EDEEF2; }
 def mascot_area(width: int, height: int, expr_fn) -> Gtk.DrawingArea:
     from nexus import mascote
     area = Gtk.DrawingArea(content_width=width, content_height=height, valign=Gtk.Align.CENTER)
-    area.set_draw_func(lambda _a, cr, w, h: mascote.desenhar(cr, w, h, expr_fn()))
+    anim, olhar, quadro = mascote.Animacao(), [0.0, 0.0], [0.0]
+
+    def desenhar(_a, cr, w, h):
+        expr = expr_fn()
+        abertura, respiro = anim.estado(quadro[0], expr)
+        mascote.desenhar(cr, w, h, expr, tuple(olhar), abertura, respiro)
+
+    def tique(_a, relogio):  # o GTK só chama com o widget na tela: escondido, nada roda
+        quadro[0] = relogio.get_frame_time() / 1e6
+        area.queue_draw()
+        return GLib.SOURCE_CONTINUE
+
+    def mover(_c, x, y):  # olhos seguem o mouse enquanto ele está sobre o Nexo
+        olhar[:] = [max(-1.0, min(1.0, (x - width / 2) / width)), max(-1.0, min(1.0, (y - height / 2) / height))]
+
+    area.set_draw_func(desenhar)
+    area.add_tick_callback(tique)
+    movimento = Gtk.EventControllerMotion()
+    movimento.connect("motion", mover)
+    movimento.connect("leave", lambda _c: olhar.__setitem__(slice(None), [0.0, 0.0]))
+    area.add_controller(movimento)
+    return area
+
+
+def arranjo_editor(name: str, arr: dict | None, on_save) -> Gtk.DrawingArea:
+    """Editor do arranjo, como em Configurações → Telas: os monitores em retângulos e o dispositivo
+    (retrato) arrastável, que encaixa na borda externa mais próxima. Salva ao soltar."""
+    from gi.repository import Gdk
+    from nexus import arranjo
+    model = Gdk.Display.get_default().get_monitors()
+    mons = [(g.x, g.y, g.width, g.height) for g in (model.get_item(i).get_geometry() for i in range(model.get_n_items()))]
+    size = arranjo.phone_size(mons)
+    rect = [arranjo.rect_of(arr, mons, size) if arr else None]
+    if rect[0] is None:  # sem arranjo (ou monitor que sumiu): à direita do monitor mais à direita
+        rect[0] = arranjo.snap(mons, (max(m[0] + m[2] for m in mons) + size[0], mons[0][1] + mons[0][3] / 2), size)[1]
+    pad = size[1] * 1.1
+    x0, y0 = min(m[0] for m in mons) - pad, min(m[1] for m in mons) - pad
+    x1, y1 = max(m[0] + m[2] for m in mons) + pad, max(m[1] + m[3] for m in mons) + pad
+    area = Gtk.DrawingArea(content_height=240, hexpand=True)
+    view = {"k": 1.0, "ox": 0.0, "oy": 0.0}
+    drag = {"on": False, "start": (0.0, 0.0)}
+
+    def to_screen(x, y):
+        return view["ox"] + (x - x0) * view["k"], view["oy"] + (y - y0) * view["k"]
+
+    def rounded(cr, x, y, w, h, r):
+        cr.new_sub_path()
+        for cx, cy, a0 in ((x + w - r, y + r, -1.5708), (x + w - r, y + h - r, 0), (x + r, y + h - r, 1.5708), (x + r, y + r, 3.1416)):
+            cr.arc(cx, cy, r, a0, a0 + 1.5708)
+        cr.close_path()
+
+    def desenhar(_a, cr, w, h):
+        view["k"] = min(w / (x1 - x0), h / (y1 - y0))
+        view["ox"], view["oy"] = (w - (x1 - x0) * view["k"]) / 2, (h - (y1 - y0) * view["k"]) / 2
+        for i, (mx, my, mw, mh) in enumerate(mons):
+            sx, sy = to_screen(mx, my)
+            rounded(cr, sx + 2, sy + 2, mw * view["k"] - 4, mh * view["k"] - 4, 8)
+            cr.set_source_rgb(0.20, 0.23, 0.30)
+            cr.fill()
+            cr.set_source_rgb(0.85, 0.88, 0.95)
+            cr.set_font_size(14)
+            cr.move_to(sx + 12, sy + 24)
+            cr.show_text(f"Monitor {i + 1}")
+        px, py, pw, ph = rect[0]
+        sx, sy = to_screen(px, py)
+        rounded(cr, sx + 1, sy + 1, pw * view["k"] - 2, ph * view["k"] - 2, 7)
+        cr.set_source_rgb(0.36, 0.60, 1.0) if not drag["on"] else cr.set_source_rgb(0.55, 0.75, 1.0)
+        cr.fill()
+        cr.set_source_rgb(0.05, 0.07, 0.12)  # barrinha de navegação: lê como celular sem texto que não cabe
+        rounded(cr, sx + pw * view["k"] * 0.3, sy + ph * view["k"] - 8, pw * view["k"] * 0.4, 3, 1.5)
+        cr.fill()
+
+    def inside(x, y):
+        px, py, pw, ph = rect[0]
+        sx, sy = to_screen(px, py)
+        return sx <= x <= sx + pw * view["k"] and sy <= y <= sy + ph * view["k"]
+
+    def begin(g, x, y):
+        drag["on"] = inside(x, y)
+        drag["start"] = (rect[0][0], rect[0][1])
+        if not drag["on"]:
+            g.set_state(Gtk.EventSequenceState.DENIED)
+
+    def update(_g, dx, dy):
+        if drag["on"]:
+            rect[0] = (drag["start"][0] + dx / view["k"], drag["start"][1] + dy / view["k"], rect[0][2], rect[0][3])
+            area.queue_draw()
+
+    def end(_g, _dx, _dy):
+        if not drag["on"]:
+            return
+        drag["on"] = False
+        px, py, pw, ph = rect[0]
+        new, rect[0] = arranjo.snap(mons, (px + pw / 2, py + ph / 2), size)
+        area.queue_draw()
+        on_save(new)
+
+    area.set_draw_func(desenhar)
+    g = Gtk.GestureDrag()
+    g.connect("drag-begin", begin)
+    g.connect("drag-update", update)
+    g.connect("drag-end", end)
+    area.add_controller(g)
+    area.update_property([Gtk.AccessibleProperty.LABEL], [f"Posição do {name} em relação aos monitores"])
     return area
 
 
@@ -161,6 +264,10 @@ class Window(Adw.ApplicationWindow):
             self.refresh()
         elif kind in ("device.connected", "device.disconnected", "audio.changed", "file.received"):
             self.refresh()
+        elif kind == "input.crossed":
+            if not ev.get("active") and ev.get("reason"):
+                self.toast(f"Borda desativada: {ev['reason']}")
+            self.refresh()
         elif kind == "text.received":
             self.toast(f"Texto de {ev.get('name')}")
         elif kind == "file.progress":
@@ -209,7 +316,12 @@ class Window(Adw.ApplicationWindow):
             self.content.append(page)
             return
         self.render_hero(d)
+        if d.get("peer"):  # PC que este controla: só o arranjo e a borda
+            self.render_input(d)
+            return
         self.render_controls(d)
+        if "input.control" in d["permissions"]:
+            self.render_input(d)
         cols = Gtk.Box(spacing=14, homogeneous=True, vexpand=True)
         cols.append(self.render_permissions(d))
         cols.append(self.render_activity(d))
@@ -253,7 +365,9 @@ class Window(Adw.ApplicationWindow):
         card.append(mascot_area(110, 87, lambda: mascote.expressao(d)))
         texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, valign=Gtk.Align.CENTER)
         texts.append(Gtk.Label(label=d["name"], xalign=0, css_classes=["nx-hero-name"]))
-        kind = {"phone": "Celular", "tablet": "Tablet"}.get(d["kind"], d["kind"])
+        kind = {"phone": "Celular", "tablet": "Tablet", "pc": "PC"}.get(d["kind"], d["kind"])
+        if d.get("peer"):
+            kind = "PC que este controla"
         state = "conectado" if d["connected"] else "fora da rede"
         audio = " · áudio do PC tocando aqui" if d["audio"] else ""
         texts.append(Gtk.Label(label=f"{kind} · {state}{audio}", xalign=0, css_classes=["nx-hero-sub"]))
@@ -268,6 +382,8 @@ class Window(Adw.ApplicationWindow):
             ("audio-volume-muted-symbolic" if d["audio"] else "audio-speakers-symbolic",
              "Parar áudio" if d["audio"] else "Áudio aqui", "nx-blue", on, d["audio"],
              lambda: self.cmd({"cmd": "audio.stop" if d["audio"] else "audio.start", "device_id": dev})),
+            ("input-mouse-symbolic", "Janela de controle", "nx-blue", "input.control" in d["permissions"], False,
+             lambda: self.cmd({"cmd": "input.control", "device_id": dev})),
             ("document-send-symbolic", "Enviar arquivo", "nx-orange", on, False, lambda: self.pick_and_send(d)),
             ("edit-paste-symbolic", "Enviar texto", "nx-green", on, False,
              lambda: self.ask_text(d, "Enviar texto", "Vai para a área de transferência do dispositivo", "send.text", "text")),
@@ -286,6 +402,35 @@ class Window(Adw.ApplicationWindow):
             grid.append(b)
         self.content.append(grid)
 
+    def render_input(self, d: dict):
+        """Travessia pela borda: o arranjo e o botão "Ativar borda"."""
+        dev = d["device_id"]
+        state = self.devs.get("input") or {}
+        mine = state.get("active") == dev
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, css_classes=["nx-card"])
+        head = Gtk.Box(spacing=10)
+        head.append(Gtk.Label(label="Teclado e mouse pela borda", xalign=0, hexpand=True, css_classes=["nx-h2"]))
+        busy = state.get("active") not in (None, dev)
+        btn = Gtk.Button(label="Desativar borda" if mine else "Ativar borda", sensitive=not busy,
+                         css_classes=["pill"] + ([] if mine else ["suggested-action"]))
+        btn.connect("clicked", lambda _b: self.daemon.command(
+            {"cmd": "input.release" if mine else "input.start", "device_id": dev},
+            lambda r: self.toast(r["warning"]) if r.get("warning") else r.get("ok") or self.toast(r.get("error", "falhou"))))
+        head.append(btn)
+        card.append(head)
+        if mine:
+            where = "no dispositivo agora" if state.get("away") else "no PC; empurre a borda marcada para atravessar"
+            tip = f"Borda ativa: o mouse está {where}. Para voltar, empurre a borda do celular que encara o PC ou aperte o Ctrl direito duas vezes."
+        else:
+            tip = ("Arraste o dispositivo até a borda de um monitor, no ponto em que ele fica na sua mesa. "
+                   "Depois toque em Ativar borda: o GNOME pede permissão e o mouse passa para o dispositivo ao empurrar essa borda. "
+                   "A Janela de controle, acima, é outro modo: controla pelo scrcpy, com o mouse sobre a janela.")
+        card.append(Gtk.Label(label=tip, xalign=0, wrap=True, css_classes=["dim-label"]))
+        card.append(arranjo_editor(d["name"], d.get("arrangement"), lambda arr: self.daemon.command(
+            {"cmd": "input.config", "device_id": dev, **arr},
+            lambda r: self.toast("Posição salva" if r.get("ok") else r.get("error", "falhou")))))
+        self.content.append(card)
+
     def render_permissions(self, d: dict) -> Gtk.Widget:
         card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, css_classes=["nx-card"])
         card.append(Gtk.Label(label=f"O {d['name']} pode, neste PC", xalign=0, css_classes=["nx-h2"], margin_bottom=6))
@@ -297,6 +442,18 @@ class Window(Adw.ApplicationWindow):
             sw.connect("notify::active", self.toggle_permission, d["device_id"], a["id"])
             row.append(sw)
             card.append(row)
+        # sentido inverso: o PC controla o dispositivo (scrcpy/adb); fica aqui para estar junto das outras chaves
+        row = Gtk.Box(css_classes=["nx-row"])
+        # um PC pareado aqui é quem controla: a chave é deixar ele controlar este PC (input.inject)
+        perm = "input.inject" if d["kind"] == "pc" else "input.control"
+        label = ("Controlar este PC com o teclado e o mouse dele" if perm == "input.inject"
+                 else "Ser controlado pelo teclado e mouse deste PC")
+        row.append(Gtk.Label(label=label, xalign=0, hexpand=True))
+        sw = Gtk.Switch(active=perm in d["permissions"], valign=Gtk.Align.CENTER)
+        sw.update_property([Gtk.AccessibleProperty.LABEL], [label])
+        sw.connect("notify::active", self.toggle_permission, d["device_id"], perm)
+        row.append(sw)
+        card.append(row)
         revoke = Gtk.Button(label="Revogar este dispositivo…", css_classes=["flat", "nx-danger"], halign=Gtk.Align.START,
                             valign=Gtk.Align.END, vexpand=True, margin_top=8)
         revoke.connect("clicked", lambda _b: self.confirm_revoke(d))
@@ -354,7 +511,8 @@ class Window(Adw.ApplicationWindow):
     def toggle_permission(self, sw, _pspec, device_id: str, action: str):
         cmd = "devices.allow" if sw.get_active() else "devices.deny"
         self.daemon.command({"cmd": cmd, "device_id": device_id, "action": action},
-                            lambda r: r.get("ok") or self.toast(r.get("error", "falhou")))
+                            lambda r: (self.refresh() if action == "input.control" else None) if r.get("ok")
+                            else self.toast(r.get("error", "falhou")))  # o botão "Controlar" depende dessa chave
 
     def confirm_revoke(self, d: dict):
         dlg = Adw.AlertDialog(heading=f"Revogar {d['name']}?",

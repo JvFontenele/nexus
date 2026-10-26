@@ -37,6 +37,8 @@ SCHEMAS = {
     "audio.start":    {},
     "audio.stop":     {},
     "audio.ready":    {"rate": int, "channels": int, "format": str},
+    "input.attach":   {},
+    "input.ready":    {"zones": list},
     "error":          {"code": str, "message": str},
 }
 
@@ -109,6 +111,12 @@ def validate(msg: dict) -> dict:
         raise ProtocolError("bad_body", f"{hex_field} deve ter 64 hex minúsculos")
     if type_ == "hello" and body["kind"] not in ("phone", "tablet", "pc"):
         raise ProtocolError("bad_body", "kind inválido")
+    if type_ == "input.ready":
+        zones = body["zones"]
+        if not 1 <= len(zones) <= 16 or not all(
+                isinstance(z, list) and len(z) == 4 and all(_is(n, int) and abs(n) <= 100000 for n in z)
+                and z[2] > 0 and z[3] > 0 for z in zones):
+            raise ProtocolError("bad_body", "zones: 1 a 16 retângulos [x, y, w, h] de inteiros")
     if type_ == "action.run":
         for k, v in body["params"].items():
             if not isinstance(k, str) or not isinstance(v, (str, int, bool)):

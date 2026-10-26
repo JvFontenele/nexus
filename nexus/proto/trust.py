@@ -58,6 +58,12 @@ class TrustStore:
                 perms.remove(action)
                 self._save()
 
+    def update(self, device_id: str, key: str, value):
+        """Grava um campo extra do registro (ex.: o arranjo da travessia)."""
+        with self._lock:
+            self.records[device_id][key] = value
+            self._save()
+
     def lookup_der(self, der: bytes | None) -> dict | None:
         """Registro do certificado de cliente visto no handshake (None = cliente não pareado)."""
         return None if der is None else self.records.get(fingerprint_der(der))

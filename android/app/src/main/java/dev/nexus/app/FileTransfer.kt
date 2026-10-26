@@ -8,35 +8,68 @@ import android.content.Intent
 import android.net.Uri
 import android.provider.MediaStore
 import android.provider.OpenableColumns
+import android.content.BroadcastReceiver
+import android.os.Handler
+import android.os.Looper
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.setValue
 import org.json.JSONObject
+
+/** Botão Cancelar da notificação de transferência (explícito e não exportado). */
+class CancelarTransferencia : BroadcastReceiver() {
+    override fun onReceive(ctx: Context, intent: Intent) { FileTransfer.cancelar(intent.getIntExtra("id", 0)) }
+}
 
 /** Arquivos entre o celular e o PC: uma conexão TLS de dados por arquivo (file.push / file.pull), sem derrubar a de controle. */
 object FileTransfer {
     private const val CHUNK = 256 * 1024
 
-    /** Notificação com barra de progresso (no máximo 4 atualizações por segundo, como no PC). */
-    private class Progresso(private val ctx: Context, private val titulo: String, private val nome: String,
-                            private val total: Long, private val icone: Int) {
+    /** Fechar a conexão de dados é o cancelamento: o PC apaga o .part (ou para de enviar) e emite file.done ok=false. */
+    class Cancelado : Exception("cancelado")
+
+    /** Transferências em andamento, para a tela (lista do Compose) e o botão Cancelar da notificação. */
+    val ativas = mutableStateListOf<Progresso>()
+    /** Quantas terminaram bem: o Nexo dá um pulinho a cada uma. */
+    var concluidas by mutableIntStateOf(0)
+    private val principal = Handler(Looper.getMainLooper())
+
+    fun cancelar(id: Int) = ativas.toList().find { it.id == id }?.let { it.cancelada = true }
+
+    /** Notificação com barra de progresso (no máximo 4 atualizações por segundo, como no PC) e Cancelar. */
+    class Progresso(private val ctx: Context, val titulo: String, val nome: String,
+                    private val total: Long, private val icone: Int) {
         private val nm = ctx.getSystemService(NotificationManager::class.java)
-        private val id = (nome + System.nanoTime()).hashCode()
+        val id = (nome + System.nanoTime()).hashCode()
         private var ultimo = 0L
+        var pct by mutableIntStateOf(0)
+        @Volatile var cancelada = false
+        private val cancelar = android.app.Notification.Action.Builder(null, "Cancelar",
+            PendingIntent.getBroadcast(ctx, id, Intent(ctx, CancelarTransferencia::class.java).putExtra("id", id),
+                PendingIntent.FLAG_IMMUTABLE)).build()
 
         init {
             nm.createNotificationChannel(android.app.NotificationChannel("transfer", "Transferências",
                 NotificationManager.IMPORTANCE_LOW))
+            principal.post { ativas.add(this) }
         }
 
         fun atualizar(feito: Long) {
+            if (cancelada) throw Cancelado()
             val agora = android.os.SystemClock.elapsedRealtime()
             if (agora - ultimo < 250 && feito < total) return
             ultimo = agora
-            val pct = if (total > 0) (feito * 100 / total).toInt() else 100
+            pct = if (total > 0) (feito * 100 / total).toInt() else 100
             nm.notify(id, android.app.Notification.Builder(ctx, "transfer").setSmallIcon(icone)
                 .setContentTitle(titulo).setContentText("$nome · $pct%").setProgress(100, pct, false)
-                .setOngoing(true).setOnlyAlertOnce(true).build())
+                .setOngoing(true).setOnlyAlertOnce(true).addAction(cancelar).build())
         }
 
-        fun fim() = nm.cancel(id)
+        fun fim(ok: Boolean = false) {
+            nm.cancel(id)
+            principal.post { ativas.remove(this); if (ok) concluidas++ }
+        }
     }
 
     private fun dataSession(ctx: Context): Session {
@@ -73,7 +106,7 @@ object FileTransfer {
                         progresso.atualizar(sent)
                     }
                 }
-                return s.expect("action.result").optString("result")
+                return s.expect("action.result").optString("result").also { progresso.fim(ok = true) }
             }
         } finally {
             progresso.fim()
@@ -105,7 +138,7 @@ object FileTransfer {
                         progresso.atualizar(got)
                     }
                 }
-                progresso.fim()
+                progresso.fim(ok = true)
                 resolver.update(uri, ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) }, null, null)
             } catch (e: Exception) {
                 progresso.fim()

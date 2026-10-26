@@ -90,16 +90,38 @@ def adb_wifi_connect(ip: str) -> None:
             return
 
 
-def mirror(model: str, ip: str | None = None) -> dict:
-    """Espelha o celular com o scrcpy (ferramenta externa opcional). Argumentos fixos: nada vem da rede."""
+def _adb_device(model: str, ip: str | None) -> tuple[str | None, str | None]:
+    """(serial, erro) do celular no adb, tentando o adb sem fio pelo IP do pareado se preciso."""
     if not shutil.which("scrcpy") or not shutil.which("adb"):
-        return {"ok": False, "error": "scrcpy/adb não instalados"}
+        return None, "scrcpy/adb não instalados"
     serial = adb_serial(model)
     if serial is None and ip:
         adb_wifi_connect(ip)  # porta da depuração sem fio muda a cada vez: descobre pelo mDNS
         serial = adb_serial(model)
     if serial is None:
-        return {"ok": False, "error": "celular não está no adb: conecte por USB ou ative a depuração sem fio"}
-    subprocess.Popen(["scrcpy", "-s", serial, "--window-title", f"Nexus · {model[:40]}", "--stay-awake"],
+        return None, "celular não está no adb: conecte por USB ou ative a depuração sem fio"
+    return serial, None
+
+
+def _scrcpy(serial: str, extra: list[str]) -> dict:
+    subprocess.Popen(["scrcpy", "-s", serial, *extra, "--stay-awake"],
                      start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return {"ok": True, "result": serial}
+
+
+def mirror(model: str, ip: str | None = None) -> dict:
+    """Espelha o celular com o scrcpy (ferramenta externa opcional). Argumentos fixos: nada vem da rede."""
+    serial, err = _adb_device(model, ip)
+    if err:
+        return {"ok": False, "error": err}
+    return _scrcpy(serial, ["--window-title", f"Nexus · {model[:40]}"])
+
+
+def control(model: str, ip: str | None = None) -> dict:
+    """Teclado e mouse do PC no celular, sem vídeo: a janelinha do scrcpy captura o mouse (Alt solta).
+    UHID: o Android vê um teclado e um mouse físicos, com o cursor dele."""
+    serial, err = _adb_device(model, ip)
+    if err:
+        return {"ok": False, "error": err}
+    return _scrcpy(serial, ["--no-video", "--no-audio", "--keyboard=uhid", "--mouse=uhid",
+                            "--window-title", f"Nexus · controle · {model[:40]}"])

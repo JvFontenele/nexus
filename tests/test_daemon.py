@@ -340,6 +340,52 @@ class TestDaemon(unittest.TestCase):
         u.send("mirror.request", {})
         self.assertEqual(u.recv()["body"]["code"], "unauthorized")
 
+    def test_input_control_needs_permission(self):
+        from unittest import mock
+        self.pair()
+        cmd = lambda **req: self.call(self.d._control_cmd(req))
+        with mock.patch("nexus.actions.desktop.control", return_value={"ok": True, "result": "serial"}) as ctl:
+            self.assertFalse(cmd(cmd="input.control", device_id=self.fp_phone)["ok"])  # desligada por padrão
+            ctl.assert_not_called()
+            self.assertTrue(cmd(cmd="devices.allow", device_id=self.fp_phone, action="input.control")["ok"])
+            self.assertTrue(cmd(cmd="input.control", device_id=self.fp_phone)["ok"])
+            ctl.assert_called_once_with("teste", "127.0.0.1")
+        self.assertFalse(cmd(cmd="devices.allow", device_id=self.fp_phone, action="input.qualquer")["ok"])
+
+    def test_input_arrangement_and_start(self):
+        from unittest import mock
+        self.pair()
+        cmd = lambda **req: self.call(self.d._control_cmd(req))
+        dev = self.fp_phone
+        good = dict(cmd="input.config", device_id=dev, edge="right", monitor=[1920, 0, 1920, 1080], start=0.2, end=0.7)
+        self.assertEqual(cmd(cmd="input.start", device_id=dev)["error"], "controle não liberado para este dispositivo")
+        self.assertTrue(cmd(cmd="devices.allow", device_id=dev, action="input.control")["ok"])
+        self.assertIn("posicione", cmd(cmd="input.start", device_id=dev)["error"])
+        for bad in ({"edge": "meio"}, {"monitor": [0, 0, 0, 10]}, {"monitor": "x"}, {"start": 0.7, "end": 0.2},
+                    {"end": 1.5}, {"start": True}, {"monitor": [0, 0, 10**9, 10]}):
+            self.assertFalse(cmd(**{**good, **bad})["ok"], bad)
+        self.assertTrue(cmd(**good)["ok"])
+        listed = next(d for d in cmd(cmd="devices.list")["devices"] if d["device_id"] == dev)
+        self.assertEqual(listed["arrangement"], {"edge": "right", "monitor": [1920, 0, 1920, 1080], "start": 0.2, "end": 0.7})
+        sink, cap = mock.MagicMock(accel=(1.0, 500.0, 3000.0, 3.0), size=(1080, 2400)), mock.MagicMock()
+        with mock.patch("nexus.actions.desktop._adb_device", return_value=("7db4da6e", None)), \
+                mock.patch("nexus.android_input.AndroidInput", return_value=sink) as mk_sink, \
+                mock.patch("nexus.capture.Capture", return_value=cap) as mk_cap:
+            sink.autoclick_on.return_value = True
+            started = cmd(cmd="input.start", device_id=dev)
+            self.assertTrue(started["ok"])
+            self.assertIn("clique automático", started["warning"])  # avisa, mas não bloqueia
+            self.assertEqual(cmd(cmd="input.start", device_id=dev)["error"], "a borda já está ativa")
+        mk_sink.assert_called_once()
+        self.assertEqual(mk_cap.call_args.kwargs["region"], ((1920, 0, 1920, 1080), 0.2, 0.7))
+        cap.start.assert_called_once()
+        self.assertEqual(cmd(cmd="input.status")["active"], dev)
+        # desligar a permissão encerra a borda
+        self.assertTrue(cmd(cmd="devices.deny", device_id=dev, action="input.control")["ok"])
+        cap.stop.assert_called_once()
+        self.d._input_ended(self.d.kvm, None)
+        self.assertIsNone(cmd(cmd="input.status")["active"])
+
     def test_audio_stream(self):
         import struct as st
         import sys

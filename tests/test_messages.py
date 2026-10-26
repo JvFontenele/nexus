@@ -30,6 +30,8 @@ VALID = {
     "audio.start": {},
     "audio.stop": {},
     "audio.ready": {"rate": 48000, "channels": 2, "format": "s16le"},
+    "input.attach": {},
+    "input.ready": {"zones": [[0, 0, 1920, 1080], [1920, 0, 1920, 1080]]},
     "error": {"code": "x", "message": "y"},
 }
 
@@ -82,6 +84,13 @@ class TestValidate(unittest.TestCase):
 
     def test_kind(self):
         self.assertEqual(self.code(env("hello", {**VALID["hello"], "kind": "tv"})), "bad_body")
+
+    def test_input_ready_zones(self):
+        for bad in ([], [[0, 0, 0, 10]], [[0, 0, 10]], [[0, 0, 1.5, 10]], [[0, 0, True, 10]], [[0, 0, 10, 10**9]],
+                    [[0, 0, 10, 10]] * 17, ["x"]):
+            with self.subTest(bad):
+                self.assertEqual(self.code(env("input.ready", {"zones": bad})), "bad_body")
+        self.assertEqual(self.code(env("input.attach", {"x": 1})), "bad_body")
 
     def test_params(self):
         for bad in ({"a": {"b": 1}}, {"a": [1]}, {"a": 1.5}, {"a": None}):

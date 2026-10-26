@@ -1,7 +1,25 @@
 package dev.nexus.app
 
 import android.content.ClipboardManager
+import android.content.ComponentName
 import android.content.Context
+import android.content.Intent
+import android.hardware.input.InputManager
+import android.os.PowerManager
+import android.provider.Settings
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.animation.togetherWith
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.key
 import android.net.Uri
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
@@ -76,6 +94,10 @@ class MainActivity : ComponentActivity() {
     private var pending by mutableStateOf<Pair<String, String>?>(null) // código, fp do PC
     private var decision: CompletableFuture<Boolean>? = null
     private var actions by mutableStateOf<List<RemoteAction>>(emptyList())
+    private var controlado by mutableStateOf(false)
+    private var autoclique by mutableStateOf(false)
+    private var bateriaLivre by mutableStateOf(true)
+    private var guia by mutableStateOf(false)
 
     private val kind get() = if (resources.configuration.smallestScreenWidthDp >= 600) "tablet" else "phone"
     private val name get() = Build.MODEL
@@ -218,6 +240,19 @@ class MainActivity : ComponentActivity() {
         nsd.discoverServices("_nexus._tcp", NsdManager.PROTOCOL_DNS_SD, listener)
     }
 
+    /** Abre a primeira tela de configuração que existir neste aparelho; senão, as informações do app. */
+    private fun abrir(vararg intents: Intent) {
+        val app = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName"))
+        for (i in listOf(*intents, app)) {
+            try { startActivity(i); return } catch (_: Exception) {} // ActivityNotFound ou SecurityException da ROM
+        }
+    }
+
+    private fun pedirBateria() = abrir(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+        Uri.parse("package:$packageName")))
+
+    private fun componente(pkg: String, cls: String) = Intent().setComponent(ComponentName(pkg, cls))
+
     // ── telas ────────────────────────────────────────────────────────────
     @Composable
     private fun Tela() {
@@ -226,10 +261,23 @@ class MainActivity : ComponentActivity() {
                 linkUp = LinkService.connected() != null
                 audioOn = LinkService.audioPlaying()
                 audioText = LinkService.lastAudioText
+                autoclique = LinkService.cliqueAutomatico(this@MainActivity)
+                bateriaLivre = getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
                 delay(1000)
             }
         }
         LaunchedEffect(linkUp) { if (linkUp) loadActions() }
+        DisposableEffect(Unit) { // teclado/mouse do PC: UHID aparece e some com a borda
+            val im = getSystemService(InputManager::class.java)
+            val l = object : InputManager.InputDeviceListener {
+                override fun onInputDeviceAdded(id: Int) { controlado = LinkService.pcControlando(this@MainActivity) }
+                override fun onInputDeviceRemoved(id: Int) = onInputDeviceAdded(id)
+                override fun onInputDeviceChanged(id: Int) = onInputDeviceAdded(id)
+            }
+            controlado = LinkService.pcControlando(this@MainActivity)
+            im.registerInputDeviceListener(l, null)
+            onDispose { im.unregisterInputDeviceListener(l) }
+        }
         val p = pending
         when {
             p != null -> Pareamento(p.first, p.second)
@@ -240,13 +288,19 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     private fun Cartao(modifier: Modifier = Modifier, conteudo: @Composable () -> Unit) {
-        Box(modifier.fillMaxWidth().background(Cores.superficie, RoundedCornerShape(24.dp)).padding(18.dp)) { conteudo() }
+        Box(modifier.fillMaxWidth().background(Cores.superficie, RoundedCornerShape(28.dp)).animateContentSize(mola())
+            .padding(18.dp)) { conteudo() }
     }
 
     @Composable
     private fun Status() {
-        if (status.isNotEmpty())
-            Text(status, color = Cores.apagado, fontSize = 13.sp, modifier = Modifier.semantics { contentDescription = status })
+        // troca de conteúdo como no notch: some rápido, o novo entra com fade e escala 0,97→1 depois de 160 ms
+        AnimatedContent(status, transitionSpec = {
+            (fadeIn(tween(220, delayMillis = 160)) + scaleIn(mola(), initialScale = 0.97f)) togetherWith fadeOut(tween(160))
+        }, label = "status") { st ->
+            if (st.isNotEmpty())
+                Text(st, color = Cores.apagado, fontSize = 13.sp, modifier = Modifier.semantics { contentDescription = st })
+        }
     }
 
     @Composable
@@ -296,7 +350,8 @@ class MainActivity : ComponentActivity() {
     private fun Inicio() {
         val pick = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { sendFiles(it) }
         val expr = when {
-            !linkUp -> "dormindo"
+            !linked -> "dormindo"
+            !linkUp -> "preocupado"
             audioOn -> "curtindo"
             else -> "conectado"
         }
@@ -313,7 +368,7 @@ class MainActivity : ComponentActivity() {
             Cartao {
                 Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
-                        Nexo(expr, 76.dp, if (linkUp) "Nexo conectado" else "Nexo dormindo: desconectado")
+                        Nexo(expr, 76.dp, if (linkUp) "Nexo conectado" else "Nexo $expr: desconectado", FileTransfer.concluidas)
                         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                             Text(pcName, fontSize = 18.sp, fontWeight = FontWeight.Bold)
                             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -328,10 +383,18 @@ class MainActivity : ComponentActivity() {
                         Text("Manter conectado", Modifier.weight(1f))
                         Switch(linked, ::toggleLink, colors = SwitchDefaults.colors(checkedTrackColor = Cores.acento))
                     }
+                    if (linked) OutlinedButton({ guia = !guia }, Modifier.fillMaxWidth().heightIn(min = 44.dp),
+                        border = BorderStroke(1.5.dp, Cores.borda)) {
+                        Text(if (bateriaLivre) "Manter o Nexus ligado" else "Manter o Nexus ligado · falta liberar", fontSize = 14.sp)
+                    }
                 }
             }
 
-            if (settings) Cartao {
+            Aparece(linked && guia) { Cartao { ManterLigado() } }
+            Aparece(controlado) { Cartao { Controle() } }
+            FileTransfer.ativas.forEach { t -> key(t.id) { Cartao { Transferindo(t) } } }
+
+            Aparece(settings) { Cartao {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     OutlinedTextField(host, { host = it }, label = { Text("IP do PC") }, singleLine = true, enabled = !busy,
                         modifier = Modifier.fillMaxWidth())
@@ -344,7 +407,7 @@ class MainActivity : ComponentActivity() {
                         Text("Esquecer este PC", color = Color(0xFFFF9B8E))
                     }
                 }
-            }
+            } }
 
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 Bloco(Icone.ESPELHAR, Cores.azulClaro, "Espelhar no PC", null, false, true, Modifier.weight(1f), ::mirror)
@@ -359,6 +422,79 @@ class MainActivity : ComponentActivity() {
 
             if (actions.isNotEmpty()) Cartao { ControlarPc() }
             Status()
+        }
+    }
+
+    /** Entra crescendo com a mola do notch; sai encolhendo com a curva de fechar (340 ms). */
+    @Composable
+    private fun Aparece(visivel: Boolean, conteudo: @Composable () -> Unit) {
+        AnimatedVisibility(visivel,
+            enter = expandVertically(mola()) + fadeIn(tween(220, delayMillis = 160)) + scaleIn(mola(), initialScale = 0.97f),
+            exit = shrinkVertically(tween(340, easing = curvaEncolher)) + fadeOut(tween(160))) { conteudo() }
+    }
+
+    @Composable
+    private fun Controle() {
+        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("O PC está controlando este celular", fontWeight = FontWeight.Bold, fontSize = 15.sp)
+            Text("O teclado e o mouse do PC estão ligados aqui.", color = Cores.apagado, fontSize = 13.sp)
+            if (autoclique) {
+                Text("O clique automático do Android está ligado: o celular vai clicar sozinho quando o ponteiro parar.",
+                    color = Cores.laranja, fontSize = 14.sp)
+                OutlinedButton({ abrir(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) },
+                    border = BorderStroke(1.5.dp, Cores.borda)) { Text("Abrir Acessibilidade") }
+            }
+        }
+    }
+
+    @Composable
+    private fun Transferindo(t: FileTransfer.Progresso) {
+        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text(t.titulo, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+            Text("${t.nome} · ${t.pct}%", color = Cores.apagado, fontSize = 13.sp)
+            LinearProgressIndicator({ t.pct / 100f }, Modifier.fillMaxWidth(), color = Cores.acento,
+                trackColor = Cores.superficie2)
+            OutlinedButton({ t.cancelada = true }, border = BorderStroke(1.dp, Color(0xFF5A3A36))) {
+                Text("Cancelar", color = Color(0xFFFF9B8E))
+            }
+        }
+    }
+
+    @Composable
+    private fun ManterLigado() {
+        val fab = Build.MANUFACTURER.lowercase()
+        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("Manter o Nexus ligado", fontWeight = FontWeight.Bold, fontSize = 15.sp)
+            Text("Para receber textos, arquivos e o áudio do PC com a tela apagada, o Android precisa deixar o Nexus " +
+                "rodando. Ele só mantém uma conexão cifrada com o seu PC e manda um sinal a cada 30 s. Ao ligar o " +
+                "celular, o Nexus volta sozinho.", color = Cores.apagado, fontSize = 13.sp)
+            if (bateriaLivre) Text("Otimização de bateria: liberada", color = Cores.verde, fontSize = 14.sp)
+            else Button(::pedirBateria) { Text("Liberar da otimização de bateria") }
+            when {
+                fab in setOf("xiaomi", "redmi", "poco") -> {
+                    Text("No HyperOS: ligue a Inicialização automática do Nexus e, em Economia de bateria, escolha " +
+                        "\"Sem restrições\".", fontSize = 13.sp)
+                    OutlinedButton({ abrir(componente("com.miui.securitycenter",
+                        "com.miui.permcenter.autostart.AutoStartManagementActivity")) },
+                        border = BorderStroke(1.5.dp, Cores.borda)) { Text("Inicialização automática") }
+                    OutlinedButton({ abrir(componente("com.miui.powerkeeper", "com.miui.powerkeeper.ui.HiddenAppsConfigActivity")
+                        .putExtra("package_name", packageName).putExtra("package_label", "Nexus")) },
+                        border = BorderStroke(1.5.dp, Cores.borda)) { Text("Economia de bateria") }
+                }
+                fab == "samsung" -> {
+                    Text("Na One UI: em Bateria, escolha \"Sem restrições\", e tire o Nexus de \"Apps em suspensão\" " +
+                        "(Cuidados com o dispositivo → Bateria → Limites de uso em segundo plano).", fontSize = 13.sp)
+                    OutlinedButton({ abrir() }, border = BorderStroke(1.5.dp, Cores.borda)) { Text("Bateria do Nexus") }
+                    OutlinedButton({ abrir(componente("com.samsung.android.lool",
+                        "com.samsung.android.sm.battery.ui.BatteryActivity")) },
+                        border = BorderStroke(1.5.dp, Cores.borda)) { Text("Limites em segundo plano") }
+                }
+                else -> {
+                    Text("Se o sistema tiver \"Inicialização automática\" ou restrição de bateria por app, libere o Nexus.",
+                        fontSize = 13.sp)
+                    OutlinedButton({ abrir() }, border = BorderStroke(1.5.dp, Cores.borda)) { Text("Informações do app") }
+                }
+            }
         }
     }
 

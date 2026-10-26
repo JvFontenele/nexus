@@ -29,6 +29,15 @@ class TestAdbSerial(unittest.TestCase):
         with mock.patch("shutil.which", return_value="/bin/x"), mock.patch.object(desktop, "adb_serial", return_value=None):
             self.assertFalse(desktop.mirror("x")["ok"])
 
+    def test_control_fixed_args(self):
+        with mock.patch("shutil.which", return_value="/bin/x"), \
+                mock.patch.object(desktop, "adb_serial", return_value="7db4da6e"), \
+                mock.patch("subprocess.Popen") as popen:
+            self.assertEqual(desktop.control("POCO; rm")["result"], "7db4da6e")
+        argv = popen.call_args[0][0]
+        self.assertEqual(argv[:7], ["scrcpy", "-s", "7db4da6e", "--no-video", "--no-audio", "--keyboard=uhid", "--mouse=uhid"])
+        self.assertIn("Nexus · controle · POCO; rm", argv)  # o nome é só o título da janela, um argumento só
+
 
 class TestAdbWifi(unittest.TestCase):
     def test_only_connects_to_paired_device_ip(self):

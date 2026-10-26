@@ -6,6 +6,10 @@
     <!-- exigida pelo tipo connectedDevice (Android 14); permissão comum, sem diálogo -->
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- religar a conexão persistente ao ligar o celular -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- pedido "Manter o Nexus ligado": o usuário confirma num diálogo do sistema -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <application android:label="Nexus" android:theme="@android:style/Theme.Material.NoActionBar">
         <activity android:name=".MainActivity" android:exported="true">
             <intent-filter>
@@ -46,6 +50,11 @@
             android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
             <intent-filter><action android:name="android.service.quicksettings.action.QS_TILE" /></intent-filter>
         </service>
+        <!-- sem LOCKED_BOOT_COMPLETED: identidade e pareamento ficam no armazenamento que só abre após o desbloqueio -->
+        <receiver android:name=".BootReceiver" android:exported="true">
+            <intent-filter><action android:name="android.intent.action.BOOT_COMPLETED" /></intent-filter>
+        </receiver>
+        <receiver android:name=".CancelarTransferencia" android:exported="false" />
         <service android:name=".LinkService" android:exported="false"
             android:foregroundServiceType="connectedDevice" />
     </application>

@@ -5,12 +5,14 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.Uri
+import android.hardware.input.InputManager
 import android.os.Build
 import android.os.IBinder
 import java.util.concurrent.Executors
@@ -21,6 +23,15 @@ import kotlin.concurrent.thread
  * Conexão persistente com o PC pareado (A03): recebe share.text/open.url e mantém o link com ping a cada 30 s.
  * Cai a conexão → tenta de novo com espera crescente (2 s … 60 s).
  */
+/** Religa a conexão persistente depois de reiniciar (connectedDevice pode nascer do BOOT_COMPLETED no Android 15+). */
+class BootReceiver : BroadcastReceiver() {
+    override fun onReceive(ctx: Context, intent: Intent) {
+        if (intent.action != Intent.ACTION_BOOT_COMPLETED) return
+        val prefs = ctx.getSharedPreferences("nexus", Context.MODE_PRIVATE)
+        if (prefs.getString("pin", null) != null && prefs.getBoolean("link", false)) LinkService.start(ctx)
+    }
+}
+
 class LinkService : Service(), Pc {
     @Volatile private var running = false
     @Volatile private var session: Session? = null
@@ -30,9 +41,20 @@ class LinkService : Service(), Pc {
     val audio by lazy {
         AudioReceiver(this) { audioText ->
             lastAudioText = audioText
-            notify(1, status(listOfNotNull(linkText, audioText).joinToString(" · ")))
+            atualizar()
         }
     }
+    @Volatile private var controlado = false
+    private val entrada = object : InputManager.InputDeviceListener {
+        override fun onInputDeviceAdded(id: Int) = mudou()
+        override fun onInputDeviceRemoved(id: Int) = mudou()
+        override fun onInputDeviceChanged(id: Int) = mudou()
+        fun mudou() { pcControlando(this@LinkService).let { if (it != controlado) { controlado = it; atualizar() } } }
+    }
+
+    /** Notificação persistente: conexão · áudio · teclado/mouse do PC. */
+    private fun atualizar() = notify(1, status(listOfNotNull(linkText, lastAudioText,
+        "PC no teclado e mouse".takeIf { controlado }).joinToString(" · ")))
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -43,6 +65,8 @@ class LinkService : Service(), Pc {
         nm.createNotificationChannel(NotificationChannel(CH_PUSH, "Recebido do PC", NotificationManager.IMPORTANCE_HIGH))
         startForeground(1, status("Conectando…"), ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
         running = true
+        getSystemService(InputManager::class.java).registerInputDeviceListener(entrada, null)
+        controlado = pcControlando(this)
         thread(name = "nexus-link") { loop() }
         pinger.scheduleWithFixedDelay({ runCatching { session?.send("ping") } }, 30, 30, TimeUnit.SECONDS)
     }
@@ -51,6 +75,7 @@ class LinkService : Service(), Pc {
 
     override fun onDestroy() {
         running = false
+        getSystemService(InputManager::class.java).unregisterInputDeviceListener(entrada)
         audio.stop()
         current = null
         pinger.shutdownNow()
@@ -77,7 +102,7 @@ class LinkService : Service(), Pc {
                     current = this
                     wait = 2
                     linkText = "Conectado a $host"
-                    notify(1, status(linkText))
+                    atualizar()
                     while (running) handle(s.recv())
                 }
             } catch (e: Exception) {
@@ -86,7 +111,8 @@ class LinkService : Service(), Pc {
                 pending.values.forEach { it.completeExceptionally(e) }
                 pending.clear()
                 if (!running) return
-                notify(1, status("Sem conexão (${e.message ?: e.javaClass.simpleName}); nova tentativa em ${wait}s"))
+                linkText = "Sem conexão (${e.message ?: e.javaClass.simpleName}); nova tentativa em ${wait}s"
+                atualizar()
                 // shortcut: reconecta por tempo, não por evento de rede; ouvir ConnectivityManager se a espera incomodar
                 Thread.sleep(wait * 1000)
                 wait = minOf(wait * 2, 60)
@@ -125,7 +151,7 @@ class LinkService : Service(), Pc {
             }
             "file.offer" -> thread(name = "nexus-file") {
                 runCatching { FileTransfer.pull(this, body) }.onFailure {
-                    notify(body.hashCode(), push("Arquivo do PC falhou", it.message ?: it.javaClass.simpleName, null))
+                    if (it !is FileTransfer.Cancelado) notify(body.hashCode(), push("Arquivo do PC falhou", it.message ?: it.javaClass.simpleName, null))
                 }
             }
             "audio.start" -> audio.start()
@@ -174,6 +200,20 @@ class LinkService : Service(), Pc {
         fun toggleAudio(): Boolean? = current?.audio?.let { val on = !it.playing; if (on) it.start() else it.stop(); on }
         private const val CH_LINK = "link"
         private const val CH_PUSH = "push"
+
+        /** O PC controla este aparelho: UHID do scrcpy-server do Nexus ou do scrcpy em janela (detecção só local). */
+        fun pcControlando(ctx: Context): Boolean {
+            val im = ctx.getSystemService(InputManager::class.java)
+            return im.inputDeviceIds.any { id ->
+                val n = im.getInputDevice(id)?.name ?: return@any false
+                n == "Nexus teclado" || n == "Nexus mouse" || n.contains("scrcpy", ignoreCase = true)
+            }
+        }
+
+        /** Clique automático da Acessibilidade (só leitura; o Nexus nunca muda essa configuração). */
+        fun cliqueAutomatico(ctx: Context): Boolean = runCatching {
+            android.provider.Settings.Secure.getInt(ctx.contentResolver, "accessibility_autoclick_enabled", 0) == 1
+        }.getOrDefault(false)
 
         fun start(ctx: Context) = ctx.startForegroundService(Intent(ctx, LinkService::class.java))
         fun stop(ctx: Context) = ctx.stopService(Intent(ctx, LinkService::class.java))
