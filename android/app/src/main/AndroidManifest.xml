@@ -13,7 +13,7 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <!-- pedido "Manter o Nexus ligado": o usuário confirma num diálogo do sistema -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
-    <application android:label="Nexus" android:theme="@android:style/Theme.Material.NoActionBar">
+    <application android:label="Nexus" android:icon="@mipmap/ic_launcher" android:theme="@android:style/Theme.Material.NoActionBar">
         <activity android:name=".MainActivity" android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
